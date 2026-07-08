@@ -4,6 +4,7 @@ import {
   SYSTEM_MODELS,
   ADAPTER_API_PROTOCOL,
   LLMAdapter,
+  DETECTOR_SYSTEM_DEFAULT_MODEL_ID,
 } from "../llm-providers.ts";
 
 describe("ADAPTER_MODELS", () => {
@@ -111,6 +112,17 @@ describe("ADAPTER_MODELS", () => {
           expect(model.id.length, `adapter "${adapter}" has empty model ID`).toBeGreaterThan(0);
         }
       }
+    });
+  });
+
+  describe("detector screening default", () => {
+    // Drift guard for the comment on DETECTOR_SYSTEM_DEFAULT_MODEL_ID: the
+    // worker resolves it as a system model for every unpinned detector, so a
+    // rename/removal of the catalog entry must fail here, not at eval time.
+    it("DETECTOR_SYSTEM_DEFAULT_MODEL_ID is a current Anthropic system model", () => {
+      const anthropic = SYSTEM_MODELS.find((s) => s.piAIProvider === "anthropic");
+      expect(anthropic).toBeDefined();
+      expect(anthropic!.models.map((m) => m.id)).toContain(DETECTOR_SYSTEM_DEFAULT_MODEL_ID);
     });
   });
 
