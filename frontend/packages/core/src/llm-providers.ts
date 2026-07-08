@@ -137,6 +137,14 @@ export const PROVIDER_PRIORITY: LLMAdapter[] = [
   LLMAdapter.AMAZON_BEDROCK,
 ];
 
+// Default screening model for detectors with no pinned detectionModel
+// (system source). Deliberately the cheap/fast tier, not the agent default:
+// detection screening runs one LLM eval per sampled trace at ingestion — the
+// highest-volume LLM workload — so unpinned detectors must track this, and
+// UI copy describing the unpinned state must show the same id the worker
+// resolves. Must stay a valid Anthropic SYSTEM_MODELS entry.
+export const DETECTOR_SYSTEM_DEFAULT_MODEL_ID = "claude-haiku-4-5";
+
 // Curated model catalog per adapter — used for dropdown selection in BYOK provider settings.
 // Adapters NOT listed here (azure, amazon-bedrock, openrouter) use free-text input.
 export const ADAPTER_MODELS: Partial<Record<LLMAdapter, LLMModelDef[]>> = {
