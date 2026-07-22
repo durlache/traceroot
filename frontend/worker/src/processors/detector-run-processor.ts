@@ -14,6 +14,8 @@ import {
 } from "../queues/detector-run-queue.js";
 import { runDetectionForTrace } from "../detection/sandbox-eval.js";
 import { writeDetectorRun, writeDetectorFinding } from "../detection/clickhouse-writer.js";
+import { withSelfTrace } from "../detection/self-trace-emitter.js";
+import { boundedJson } from "../detection/traced-complete.js";
 
 const BACKEND_URL = process.env.BACKEND_INTERNAL_URL || "http://localhost:8000";
 const INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET || "";
@@ -124,6 +126,8 @@ interface TriggeredResult {
   detectorName: string;
   summary: string;
   data: unknown;
+  /** Whether this run's self-trace was emitted; carried to the triggered run write. */
+  selfTraced: boolean;
 }
 
 export interface ScanUsage {
@@ -172,6 +176,12 @@ interface SingleDetectorOutcome {
  * returns the result WITHOUT writing anything — processTrace handles the
  * finding write and the run write so all triggered runs share the same
  * finding_id.
+ *
+ * The eval runs inside withSelfTrace, which records it live as the run's
+ * self-trace (the traced pi-ai call becomes a real LLM child span). The
+ * failed/not-triggered writes here stamp the resulting selfTraced flag
+ * directly; the triggered write in evaluateTrace reads it from the returned
+ * TriggeredResult.
  */
 async function runSingleDetector(params: {
   detector: {
@@ -191,24 +201,56 @@ async function runSingleDetector(params: {
   const { detector, traceId, projectId, spansJsonl, workspaceId } = params;
   const runId = deterministicRunId(projectId, traceId, detector.id);
 
-  let result: Awaited<ReturnType<typeof runDetectionForTrace>>;
-  try {
-    result = await runDetectionForTrace({
-      traceId,
-      spansJsonl,
-      detector: {
-        id: detector.id,
-        name: detector.name,
-        prompt: detector.prompt,
-        outputSchema: detector.outputSchema,
-        detectionModel: detector.detectionModel,
-        detectionProvider: detector.detectionProvider,
-        detectionSource: detector.detectionSource,
-      },
-      workspaceId,
-    });
-  } catch (e) {
-    console.error(`[Detector] Run failed for detector ${detector.id} on trace ${traceId}:`, e);
+  // The eval runs inside the self-trace: the detector-run root span is live
+  // for its whole duration, and the traced pi-ai call inside becomes a real
+  // LLM child span. fn always runs exactly once; a tracing failure only
+  // degrades selfTraced to false.
+  const run = await withSelfTrace(
+    {
+      runId,
+      projectId,
+      detectorId: detector.id,
+      detectorName: detector.name,
+      scannedTraceId: traceId,
+    },
+    () =>
+      runDetectionForTrace({
+        traceId,
+        spansJsonl,
+        detector: {
+          id: detector.id,
+          name: detector.name,
+          prompt: detector.prompt,
+          outputSchema: detector.outputSchema,
+          detectionModel: detector.detectionModel,
+          detectionProvider: detector.detectionProvider,
+          detectionSource: detector.detectionSource,
+        },
+        workspaceId,
+      }),
+    {
+      // Root boundary I/O — promoted to the trace record by the transform,
+      // so the trace header shows what the run asked and what it concluded.
+      recordIo: (result) => ({
+        input: boundedJson({
+          detector: detector.name,
+          prompt: detector.prompt,
+          scannedTraceId: traceId,
+        }),
+        output: boundedJson({
+          identified: result.identified,
+          summary: result.summary,
+        }),
+      }),
+    },
+  );
+
+  const selfTraced = run.selfTraced;
+  if (!run.ok) {
+    console.error(
+      `[Detector] Run failed for detector ${detector.id} on trace ${traceId}:`,
+      run.error,
+    );
     await writeDetectorRun({
       runId,
       detectorId: detector.id,
@@ -216,9 +258,11 @@ async function runSingleDetector(params: {
       traceId,
       findingId: null,
       status: "failed",
+      selfTraced,
     }).catch((err) => console.error("[Detector] Failed to write run:", err));
     return { triggered: null, usage: null };
   }
+  const result = run.value;
 
   const usage: ScanUsage = {
     inferenceCost: result.inferenceCost,
@@ -243,6 +287,7 @@ async function runSingleDetector(params: {
       traceId,
       findingId: null,
       status: result.error ? "failed" : "completed",
+      selfTraced,
     }).catch((err) => console.error("[Detector] Failed to write run:", err));
     return { triggered: null, usage };
   }
@@ -258,6 +303,7 @@ async function runSingleDetector(params: {
       detectorName: detector.name,
       summary: result.summary,
       data: result.data,
+      selfTraced,
     },
     usage,
   };
@@ -438,6 +484,7 @@ async function evaluateTrace(
         findingId,
         status: "completed",
         timestampMs: findingTimestamp,
+        selfTraced: r.selfTraced,
       }).catch((err) => console.error("[Detector] Failed to write run:", err)),
     ),
   );
