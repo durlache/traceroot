@@ -19,7 +19,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { trace } from "@opentelemetry/api";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { TraceRoot, observe } from "@traceroot-ai/traceroot";
 
 export interface SelfTraceRunMeta {
@@ -49,10 +49,12 @@ export interface SelfTraceOptions<T> {
   /**
    * Derive the root span's boundary input/output from fn's result — the
    * transform promotes root I/O to the trace record, so this is what fills
-   * the trace header (e.g. detector prompt in, verdict out). Only called on
-   * success; must return already-bounded strings.
+   * the trace header (e.g. detector prompt in, verdict out). `error` marks a
+   * run that resolved with a failure result (fn didn't throw, e.g. a provider
+   * error verdict): the root span gets ERROR status with that message. Only
+   * called on a resolved fn; must return already-bounded strings.
    */
-  recordIo?: (value: T) => { input?: string; output?: string };
+  recordIo?: (value: T) => { input?: string; output?: string; error?: string };
 }
 
 const selfTraceScope = new AsyncLocalStorage<SelfTraceScope>();
@@ -133,18 +135,28 @@ export async function withSelfTrace<T>(
   }
   const scope: SelfTraceScope = { traceId, projectId: meta.projectId };
 
-  // Tracks whether fn itself ran: if observe's machinery throws BEFORE
-  // reaching fn, we must still run fn exactly once (plainly).
+  // Tracks how far fn itself got: if observe's machinery throws BEFORE
+  // reaching fn, we must still run fn exactly once (plainly); if it throws
+  // AFTER fn completed, the run succeeded and only the tracing is lost.
   let fnRan = false;
+  let fnCompleted = false;
+  let fnValue: T | undefined;
   const wrapped = async (): Promise<T> => {
     fnRan = true;
     const value = await fn();
+    fnValue = value;
+    fnCompleted = true;
     try {
       if (options.recordIo) {
         const io = options.recordIo(value);
         const root = trace.getActiveSpan();
         if (io.input !== undefined) root?.setAttribute("traceroot.span.input", io.input);
         if (io.output !== undefined) root?.setAttribute("traceroot.span.output", io.output);
+        // A run can resolve with a failure result (provider error, timeout,
+        // missing key) without throwing — the root must not read as OK.
+        if (io.error !== undefined) {
+          root?.setStatus({ code: SpanStatusCode.ERROR, message: io.error });
+        }
       }
     } catch (err) {
       console.error("[Detector] self-trace boundary io failed:", err);
@@ -175,6 +187,13 @@ export async function withSelfTrace<T>(
     );
     return { ok: true, value, selfTraced: true };
   } catch (error) {
+    // fn finished but observe's machinery failed afterwards (e.g. ending the
+    // root): the evaluation succeeded — return its value and only degrade the
+    // tracing, which may not have exported.
+    if (fnCompleted) {
+      console.error("[Detector] self-trace observe failed after fn:", error);
+      return { ok: true, value: fnValue as T, selfTraced: false };
+    }
     // observe sets the root's error status and rethrows fn's error; if fn
     // never ran, the failure was tracing machinery — degrade and run plainly.
     if (fnRan) return { ok: false, error, selfTraced: true };

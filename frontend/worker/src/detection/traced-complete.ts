@@ -30,7 +30,13 @@ interface CompletionContextLike {
 }
 
 function truncate(text: string): string {
-  return text.length > LLM_IO_CAP ? `${text.slice(0, LLM_IO_CAP)}…` : text;
+  if (text.length <= LLM_IO_CAP) return text;
+  // Don't split a surrogate pair at the cap: a dangling high surrogate would
+  // corrupt the recorded text's last character, so drop it instead.
+  let end = LLM_IO_CAP;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${text.slice(0, end)}…`;
 }
 
 /**

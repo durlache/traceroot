@@ -75,7 +75,13 @@ async function main(): Promise<void> {
 
   // Construct the self-trace emitter up front so the first detector run does
   // not pay the provider setup, and misconfiguration (no secret) logs at boot.
-  initSelfTraceEmitter();
+  // Best-effort like every other tracing path: an init throw here must degrade
+  // to untraced runs (withSelfTrace retries lazily), never crash the worker.
+  try {
+    initSelfTraceEmitter();
+  } catch (error) {
+    console.error("[Detector Worker] self-trace emitter init failed at boot:", error);
+  }
 
   console.log("[Detector Worker] Workers are running. Press Ctrl+C to stop.");
 

@@ -231,6 +231,8 @@ async function runSingleDetector(params: {
     {
       // Root boundary I/O — promoted to the trace record by the transform,
       // so the trace header shows what the run asked and what it concluded.
+      // An eval that resolved with a failure result marks the root as errored
+      // so the linked trace reflects the failed run.
       recordIo: (result) => ({
         input: boundedJson({
           detector: detector.name,
@@ -241,6 +243,7 @@ async function runSingleDetector(params: {
           identified: result.identified,
           summary: result.summary,
         }),
+        error: result.error,
       }),
     },
   );

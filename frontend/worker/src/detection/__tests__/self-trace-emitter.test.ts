@@ -11,6 +11,7 @@ vi.mock("@traceroot-ai/traceroot", () => ({
   observe: mockObserve,
 }));
 
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import {
   withSelfTrace,
   currentSelfTraceScope,
@@ -143,6 +144,53 @@ describe("with a secret (SDK-traced path)", () => {
     });
     expect(calls).toBe(1);
     expect(run).toEqual({ ok: true, value: "survived", selfTraced: false });
+  });
+
+  it("marks the root errored when recordIo reports an eval failure result", async () => {
+    const fakeSpan = { setAttribute: vi.fn(), setStatus: vi.fn() };
+    const spy = vi.spyOn(trace, "getActiveSpan").mockReturnValue(fakeSpan as never);
+    try {
+      await withSelfTrace(meta(), async () => ({}), {
+        recordIo: () => ({ input: "in", output: "out", error: "provider down" }),
+      });
+      expect(fakeSpan.setAttribute).toHaveBeenCalledWith("traceroot.span.input", "in");
+      expect(fakeSpan.setAttribute).toHaveBeenCalledWith("traceroot.span.output", "out");
+      expect(fakeSpan.setStatus).toHaveBeenCalledWith({
+        code: SpanStatusCode.ERROR,
+        message: "provider down",
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("leaves the root status untouched when recordIo reports no error", async () => {
+    const fakeSpan = { setAttribute: vi.fn(), setStatus: vi.fn() };
+    const spy = vi.spyOn(trace, "getActiveSpan").mockReturnValue(fakeSpan as never);
+    try {
+      await withSelfTrace(meta(), async () => ({}), {
+        recordIo: () => ({ input: "in", output: "out" }),
+      });
+      expect(fakeSpan.setStatus).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("returns fn's success when observe fails after fn completed", async () => {
+    // e.g. the SDK throws while ending the root span — the evaluation itself
+    // finished, so the run must stay ok:true and only lose its tracing.
+    mockObserve.mockImplementation(async (_opts: unknown, fn: () => Promise<unknown>) => {
+      await fn();
+      throw new Error("span.end exploded");
+    });
+    let calls = 0;
+    const run = await withSelfTrace(meta(), async () => {
+      calls += 1;
+      return "verdict";
+    });
+    expect(calls).toBe(1);
+    expect(run).toEqual({ ok: true, value: "verdict", selfTraced: false });
   });
 
   it("still runs fn once when the meta is unusable (never throws into the run)", async () => {

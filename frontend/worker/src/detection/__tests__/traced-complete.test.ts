@@ -133,6 +133,39 @@ describe("tracedComplete inside a self-trace scope", () => {
     expect(parsed.messages[0].content.endsWith("…")).toBe(true);
   });
 
+  it("never splits a surrogate pair at the truncation cap", async () => {
+    // An emoji (surrogate pair) straddling the cap: a naive slice would leave
+    // a dangling high surrogate as the last recorded character.
+    const straddling = `${"x".repeat(LLM_IO_CAP - 1)}😀${"y".repeat(100)}`;
+    const huge = { ...CTX, messages: [{ role: "user", content: straddling }] };
+    await withSelfTrace(META, () => tracedComplete(MODEL as never, huge as never, {} as never));
+
+    const llm = exporter.getFinishedSpans().find((s) => s.name.startsWith("chat"))!;
+    const parsed = JSON.parse(String(llm.attributes["traceroot.span.input"])) as {
+      messages: { content: string }[];
+    };
+    const content = parsed.messages[0].content;
+    expect(content.endsWith("…")).toBe(true);
+    // The dangling high surrogate was dropped, not recorded.
+    const beforeEllipsis = content.charCodeAt(content.length - 2);
+    expect(beforeEllipsis >= 0xd800 && beforeEllipsis <= 0xdbff).toBe(false);
+  });
+
+  it("marks aborted (timed-out) responses as errored spans", async () => {
+    // sandbox-eval's watchdog timeout resolves with stopReason "aborted"
+    // instead of throwing — the span must not read as a healthy call.
+    mockComplete.mockResolvedValue({
+      ...RESPONSE,
+      content: [],
+      stopReason: "aborted",
+    });
+    await withSelfTrace(META, () => tracedComplete(MODEL as never, CTX as never, {} as never));
+
+    const llm = exporter.getFinishedSpans().find((s) => s.name.startsWith("chat"))!;
+    expect(llm.status.code).toBe(SpanStatusCode.ERROR);
+    expect(llm.status.message).toBe("aborted (timeout)");
+  });
+
   it("marks provider-error responses as errored spans", async () => {
     mockComplete.mockResolvedValue({
       ...RESPONSE,
