@@ -80,8 +80,8 @@ function hangingRunHandle() {
   };
 }
 
-/** session.run is always called as run(argv, { env, cwd }). */
-type RunCall = [string[], { env?: Record<string, string>; cwd?: string }];
+/** session.run is always called as run(argv, { env }). */
+type RunCall = [string[], { env?: Record<string, string> }];
 
 const lastRun = () => mockSession.run.mock.lastCall as RunCall;
 const runCmds = () => (mockSession.run.mock.calls as RunCall[]).map((c) => c[0].at(-1));
@@ -207,21 +207,37 @@ describe("TenkiExecutor", () => {
       expect(result).toEqual({ stdout: "hello world", stderr: "warn", code: 0 });
       const [argv] = lastRun();
       expect(argv.slice(0, 2)).toEqual(["sudo", "-E"]);
-      expect(argv.slice(-2)).toEqual(["-lc", "echo hello world"]);
+      expect(argv.slice(-2)).toEqual(["-lc", "cd /workspace && echo hello world"]);
     });
 
     it("always bounds execution in-guest with coreutils timeout (default when none given)", async () => {
       await executor.init();
       await executor.exec("do thing");
       const [argv] = lastRun();
-      expect(argv).toEqual(["sudo", "-E", "timeout", "900", "bash", "-lc", "do thing"]);
+      expect(argv).toEqual([
+        "sudo",
+        "-E",
+        "timeout",
+        "900",
+        "bash",
+        "-lc",
+        "cd /workspace && do thing",
+      ]);
     });
 
     it("uses the caller's timeout when supplied", async () => {
       await executor.init();
       await executor.exec("sleep 1", { timeout: 10 });
       const [argv] = lastRun();
-      expect(argv).toEqual(["sudo", "-E", "timeout", "10", "bash", "-lc", "sleep 1"]);
+      expect(argv).toEqual([
+        "sudo",
+        "-E",
+        "timeout",
+        "10",
+        "bash",
+        "-lc",
+        "cd /workspace && sleep 1",
+      ]);
     });
 
     it("passes env out-of-band, never in the command string", async () => {
@@ -285,24 +301,35 @@ describe("TenkiExecutor", () => {
       expect(result.stderr).toBe("");
     });
 
-    it("runs in /workspace after init, but bootstraps in the guest default", async () => {
+    it("scopes commands into /workspace after init, but not the bootstrap", async () => {
       await executor.init();
-      // the init mkdir bootstrap must NOT set cwd (/workspace doesn't exist yet)
+      // the init mkdir bootstrap runs before workDir is set → no cd prefix
+      // (/workspace doesn't exist yet, so we must stay in the guest default)
       const bootstrap = (mockSession.run.mock.calls as RunCall[]).find((c) =>
         c[0].at(-1)?.includes("mkdir -p /workspace/repos"),
       );
-      expect(bootstrap?.[1].cwd).toBeUndefined();
+      expect(bootstrap![0].at(-1)).not.toContain("cd ");
 
-      // subsequent commands run in /workspace, matching the bash tool contract
+      // subsequent commands are cd'd into /workspace (the SDK run() cwd option is
+      // ignored through sudo + the login shell, verified live), matching the bash
+      // tool's advertised working directory.
       await executor.exec("ls repos");
-      expect(lastRun()[1].cwd).toBe("/workspace");
+      expect(lastRun()[0].at(-1)).toBe("cd /workspace && ls repos");
     });
 
     it("treats a non-positive timeout as unset and applies the default (never `timeout 0`)", async () => {
       await executor.init();
       await executor.exec("thing", { timeout: 0 });
       const [argv] = lastRun();
-      expect(argv).toEqual(["sudo", "-E", "timeout", "900", "bash", "-lc", "thing"]);
+      expect(argv).toEqual([
+        "sudo",
+        "-E",
+        "timeout",
+        "900",
+        "bash",
+        "-lc",
+        "cd /workspace && thing",
+      ]);
     });
 
     it("surfaces a timeout (exit 124) as a clear message, not 'command exit'", async () => {

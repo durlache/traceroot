@@ -198,12 +198,18 @@ export class TenkiExecutor implements Executor {
     // silently reintroducing the unbounded case (and differing from Docker).
     const requested = options?.timeout;
     const timeoutSecs = requested && requested > 0 ? requested : DEFAULT_EXEC_TIMEOUT_SECS;
-    const argv = ["sudo", "-E", "timeout", String(timeoutSecs), "bash", "-lc", command];
 
     // Run in the workspace dir so relative-path commands behave as the bash tool
-    // advertises ("Working directory is /workspace"). Empty during the init
-    // bootstrap → guest default, which is correct (/workspace doesn't exist yet).
-    const proc = this.session.run(argv, { env: options?.env, cwd: this.workDir || undefined });
+    // advertises ("Working directory is /workspace"). The SDK's run() `cwd`
+    // option is NOT honored through our `sudo -E … bash -lc` wrapper (sudo + the
+    // login shell land in /home/tenki — verified live), so cd explicitly.
+    // this.workDir is a fixed literal (never user input); it's empty only during
+    // the init bootstrap, before /workspace exists, when the guest default is
+    // correct.
+    const scoped = this.workDir ? `cd ${this.workDir} && ${command}` : command;
+    const argv = ["sudo", "-E", "timeout", String(timeoutSecs), "bash", "-lc", scoped];
+
+    const proc = this.session.run(argv, { env: options?.env });
 
     let onAbort: (() => void) | undefined;
     const aborted = signal
