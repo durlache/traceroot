@@ -8,6 +8,7 @@ const mockSession = {
   writeFile: vi.fn(),
   readFile: vi.fn(),
   close: vi.fn(),
+  closeIfOpen: vi.fn(),
 };
 
 const mockClient = {
@@ -79,8 +80,8 @@ function hangingRunHandle() {
   };
 }
 
-/** session.run is always called as run(argv, { env }). */
-type RunCall = [string[], { env?: Record<string, string> }];
+/** session.run is always called as run(argv, { env, cwd }). */
+type RunCall = [string[], { env?: Record<string, string>; cwd?: string }];
 
 const lastRun = () => mockSession.run.mock.lastCall as RunCall;
 const runCmds = () => (mockSession.run.mock.calls as RunCall[]).map((c) => c[0].at(-1));
@@ -181,7 +182,7 @@ describe("TenkiExecutor", () => {
       );
 
       await expect(executor.init()).rejects.toThrow(/workspace setup failed/);
-      expect(mockSession.close).toHaveBeenCalled();
+      expect(mockSession.closeIfOpen).toHaveBeenCalled();
       expect(mockClient.close).toHaveBeenCalled();
       expect(executor.isReady()).toBe(false);
     });
@@ -282,6 +283,52 @@ describe("TenkiExecutor", () => {
       expect(result.code).toBe(128);
       expect(result.stdout).toBe("fatal: repository not found");
       expect(result.stderr).toBe("");
+    });
+
+    it("runs in /workspace after init, but bootstraps in the guest default", async () => {
+      await executor.init();
+      // the init mkdir bootstrap must NOT set cwd (/workspace doesn't exist yet)
+      const bootstrap = (mockSession.run.mock.calls as RunCall[]).find((c) =>
+        c[0].at(-1)?.includes("mkdir -p /workspace/repos"),
+      );
+      expect(bootstrap?.[1].cwd).toBeUndefined();
+
+      // subsequent commands run in /workspace, matching the bash tool contract
+      await executor.exec("ls repos");
+      expect(lastRun()[1].cwd).toBe("/workspace");
+    });
+
+    it("treats a non-positive timeout as unset and applies the default (never `timeout 0`)", async () => {
+      await executor.init();
+      await executor.exec("thing", { timeout: 0 });
+      const [argv] = lastRun();
+      expect(argv).toEqual(["sudo", "-E", "timeout", "900", "bash", "-lc", "thing"]);
+    });
+
+    it("surfaces a timeout (exit 124) as a clear message, not 'command exit'", async () => {
+      await executor.init();
+      mockSession.run.mockImplementationOnce(() => runHandle({ exitCode: 124, reason: "exit" }));
+      const result = await executor.exec("slow", { timeout: 5 });
+      expect(result.code).toBe(124);
+      expect(result.stderr).toBe("command timed out after 5s");
+    });
+
+    it("has a host-side deadline so an unresponsive guest cannot hang the caller", async () => {
+      vi.useFakeTimers();
+      try {
+        await executor.init();
+        const handle = hangingRunHandle();
+        mockSession.run.mockReturnValueOnce(handle);
+
+        const p = executor.exec("wedged", { timeout: 5 }); // no AbortSignal
+        const assertion = expect(p).rejects.toThrow(/host deadline/);
+        // advance past timeout(5s) + grace(30s)
+        await vi.advanceTimersByTimeAsync(36_000);
+        await assertion;
+        expect(handle.kill).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("throws if not initialized", async () => {
@@ -470,26 +517,61 @@ describe("TenkiExecutor", () => {
 
       await executor.destroy();
 
-      expect(mockSession.close).toHaveBeenCalled();
+      expect(mockSession.closeIfOpen).toHaveBeenCalled();
       expect(mockClient.close).toHaveBeenCalled();
       expect(executor.isReady()).toBe(false);
     });
 
     it("no-ops if not initialized", async () => {
       await executor.destroy();
-      expect(mockSession.close).not.toHaveBeenCalled();
+      expect(mockSession.closeIfOpen).not.toHaveBeenCalled();
     });
 
     it("surfaces a failed terminate and retains the handle for retry", async () => {
       await executor.init();
-      mockSession.close.mockRejectedValueOnce(new Error("terminate failed"));
+      mockSession.closeIfOpen.mockRejectedValueOnce(new Error("terminate failed"));
 
       await expect(executor.destroy()).rejects.toThrow(/terminate failed/);
       expect(executor.isReady()).toBe(true);
 
-      mockSession.close.mockResolvedValueOnce(undefined);
+      mockSession.closeIfOpen.mockResolvedValueOnce(undefined);
       await executor.destroy();
       expect(executor.isReady()).toBe(false);
+    });
+
+    it("tears down a sandbox created by an in-flight init (no leak on concurrent destroy)", async () => {
+      // Hold create() open so destroy() arrives while init is mid-flight.
+      let releaseCreate: (s: typeof mockSession) => void;
+      mockClient.create.mockReturnValueOnce(
+        new Promise((resolve) => {
+          releaseCreate = resolve;
+        }),
+      );
+
+      const initP = executor.init(); // starts, awaiting create()
+      const destroyP = executor.destroy(); // must await the in-flight init, not no-op
+      releaseCreate!(mockSession); // create resolves → init finishes → destroy adopts the session
+
+      await Promise.all([initP, destroyP]);
+      expect(mockSession.closeIfOpen).toHaveBeenCalled(); // the created VM was torn down
+      expect(executor.isReady()).toBe(false);
+    });
+  });
+
+  describe("failed init recovery", () => {
+    it("does not report a half-initialized sandbox as ready, and a retry re-inits", async () => {
+      // First init: setup fails AND cleanup close also fails — the session must
+      // still be cleared so the guard can't report the broken sandbox as ready.
+      mockSession.run.mockImplementationOnce(() => runHandle({ exitCode: 1, stderr: "boom" }));
+      mockSession.closeIfOpen.mockRejectedValueOnce(new Error("close failed too"));
+
+      await expect(executor.init()).rejects.toThrow(/workspace setup failed/);
+      expect(executor.isReady()).toBe(false);
+
+      // Retry: a fresh create() runs (guard did not short-circuit on a stale session).
+      await executor.init();
+      expect(mockClient.create).toHaveBeenCalledTimes(2);
+      expect(executor.isReady()).toBe(true);
     });
   });
 });

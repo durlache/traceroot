@@ -183,7 +183,10 @@ llmKeys:
     anthropicApiKey: "anthropic-api-key"
     openaiApiKey: "openai-api-key"
     daytonaApiKey: "daytona-api-key"
-    # Secret key holding the Tenki API key (when sandboxProvider: "tenki").
+    # Secret key holding the Tenki API key (when sandboxProvider: "tenki"). The
+    # env var is mounted `optional: true` (see agent/deployment.yaml), so existing
+    # installs whose Secret has no tenki entry upgrade cleanly — opting in just
+    # means adding this key to the Secret.
     tenkiApiKey: "tenki-api-key"
 
 betterAuth:

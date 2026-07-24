@@ -16,6 +16,12 @@ const MAX_DURATION_MS = Number(process.env.TENKI_MAX_DURATION_MS) || 2 * 60 * 60
 // caller supplies no timeout, so nothing runs unbounded.
 const DEFAULT_EXEC_TIMEOUT_SECS = Number(process.env.TENKI_EXEC_TIMEOUT_SECS) || 900;
 
+// Host-side deadline = the in-guest timeout plus this grace. The in-guest
+// `timeout` handles the normal case; this backstop unblocks callers if the guest
+// itself goes unresponsive (paused by idle timeout, torn down mid-exec) so
+// `await proc` would otherwise never settle.
+const HOST_TIMEOUT_GRACE_SECS = 30;
+
 /** Drain a byte stream to a single buffer (the SDK exposes stdout/stderr as streams). */
 async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const reader = stream.getReader();
@@ -96,22 +102,51 @@ export class TenkiExecutor implements Executor {
         metadata: { "traceroot.session": "true" },
       });
 
-      // Use /workspace consistently with the Docker/Daytona executors.
-      this.workDir = "/workspace";
+      // Create the /workspace layout BEFORE adopting it as the working dir: the
+      // bootstrap must run in the guest default (/home/tenki) because exec() sets
+      // cwd to this.workDir and /workspace doesn't exist yet. Only once it exists
+      // do we switch, so every later command runs in /workspace — matching the
+      // Docker/Daytona executors and the bash tool's advertised working dir.
       const setup = await this.exec("mkdir -p /workspace/repos /workspace/traces /workspace/notes");
       if (setup.code !== 0) {
         throw new Error(`TenkiExecutor: workspace setup failed: ${setup.stderr || setup.stdout}`);
       }
+      this.workDir = "/workspace";
 
       console.log(`[TenkiExecutor] Sandbox ready (${this.session.id}), workDir: ${this.workDir}`);
     } catch (err) {
-      // Best-effort teardown of whatever was allocated, then surface the
-      // original failure — a cleanup error must not mask why init() failed.
-      await this.destroy().catch((cleanupErr) => {
-        console.warn("[TenkiExecutor] cleanup after failed init() also failed", cleanupErr);
-      });
+      // Force a full reset on failure so a retry re-inits cleanly. Unlike
+      // destroy() (which retains a live handle for retry), a half-initialized
+      // session must NOT survive: leaving this.session set would make the init
+      // guard report a broken sandbox as ready.
+      await this.resetAfterFailedInit();
       throw err;
     }
+  }
+
+  // Best-effort teardown that ALWAYS clears state, used only on the init failure
+  // path. A lingering VM (if closeIfOpen also fails) is bounded by the maxDuration
+  // backstop; the invariant that matters here is that no half-initialized session
+  // survives to satisfy the init/isReady guard.
+  private async resetAfterFailedInit(): Promise<void> {
+    try {
+      if (this.session) await this.session.closeIfOpen();
+    } catch (err) {
+      console.warn(
+        "[TenkiExecutor] cleanup after failed init() failed; VM lingers until backstop",
+        err,
+      );
+    }
+    this.session = null;
+    if (this.client) {
+      try {
+        this.client.close();
+      } catch {
+        // best-effort
+      }
+      this.client = null;
+    }
+    this.workDir = "";
   }
 
   // Tenki requires a project on create even for single-project accounts. Resolve
@@ -158,10 +193,17 @@ export class TenkiExecutor implements Executor {
     // Commands run as root via `sudo -E`: the Docker/Daytona executors run as
     // root, and Tenki's guest user is unprivileged `tenki`; -E keeps the
     // out-of-band env so secrets never hit argv.
-    const timeoutSecs = options?.timeout ?? DEFAULT_EXEC_TIMEOUT_SECS;
+    // Treat a non-positive timeout as "unset" and fall back to the default —
+    // `?? ` would pass 0 through, and coreutils `timeout 0` means NO limit,
+    // silently reintroducing the unbounded case (and differing from Docker).
+    const requested = options?.timeout;
+    const timeoutSecs = requested && requested > 0 ? requested : DEFAULT_EXEC_TIMEOUT_SECS;
     const argv = ["sudo", "-E", "timeout", String(timeoutSecs), "bash", "-lc", command];
 
-    const proc = this.session.run(argv, { env: options?.env });
+    // Run in the workspace dir so relative-path commands behave as the bash tool
+    // advertises ("Working directory is /workspace"). Empty during the init
+    // bootstrap → guest default, which is correct (/workspace doesn't exist yet).
+    const proc = this.session.run(argv, { env: options?.env, cwd: this.workDir || undefined });
 
     let onAbort: (() => void) | undefined;
     const aborted = signal
@@ -175,6 +217,22 @@ export class TenkiExecutor implements Executor {
         })
       : null;
 
+    // Host-side backstop: the in-guest `timeout` needs a live guest to fire, so
+    // guard against an unresponsive one (paused/torn down) that would leave
+    // `await proc` hanging forever — especially for callers with no AbortSignal.
+    let hostTimer: ReturnType<typeof setTimeout> | undefined;
+    const hostDeadline = new Promise<never>((_, reject) => {
+      hostTimer = setTimeout(
+        () => {
+          void proc.kill().catch(() => {});
+          reject(
+            new Error(`exec exceeded host deadline (guest unresponsive after ${timeoutSecs}s)`),
+          );
+        },
+        (timeoutSecs + HOST_TIMEOUT_GRACE_SECS) * 1000,
+      );
+    });
+
     const collect = (async () => {
       const [stdoutBuf, stderrBuf] = await Promise.all([
         readAll(proc.stdout),
@@ -185,9 +243,9 @@ export class TenkiExecutor implements Executor {
     })();
 
     try {
-      const { stdoutBuf, stderrBuf, result } = aborted
-        ? await Promise.race([collect, aborted])
-        : await collect;
+      const { stdoutBuf, stderrBuf, result } = await Promise.race(
+        aborted ? [collect, hostDeadline, aborted] : [collect, hostDeadline],
+      );
 
       // Decode the raw bytes WITHOUT trimming. The SDK's stdoutText/stderrText
       // helpers `.trim()`, which would drop leading indentation and trailing
@@ -198,17 +256,21 @@ export class TenkiExecutor implements Executor {
 
       // Trust the outcome, not exitCode alone: a signaled command can report
       // exitCode 0 ("exit_code=0 + SIGKILL reads as success" was a review
-      // finding). When such a failure carries no output, fold the guest-agent's
-      // reason in so the one useful diagnostic isn't lost — but never shadow
-      // real output (the clone path merges git's error onto stdout via 2>&1).
+      // finding). Surface a timeout clearly (coreutils `timeout` exits 124), and
+      // otherwise fold the guest reason into empty output — but never shadow real
+      // output (the clone path merges git's error onto stdout via 2>&1).
       const ok = code === 0 && !result.signal;
       if (!ok && code === 0) code = 1;
-      if (code !== 0 && !stderr && !stdout) {
+      if (code === 124) {
+        const note = `command timed out after ${timeoutSecs}s`;
+        stderr = stderr ? `${stderr}\n${note}` : note;
+      } else if (code !== 0 && !stderr && !stdout) {
         stderr = result.reason ? `command ${result.reason}` : "command failed";
       }
 
       return { stdout, stderr, code };
     } finally {
+      if (hostTimer) clearTimeout(hostTimer);
       if (signal && onAbort) signal.removeEventListener("abort", onAbort);
     }
   }
@@ -258,14 +320,24 @@ export class TenkiExecutor implements Executor {
   }
 
   async destroy(): Promise<void> {
-    // Terminate the session, and only clear the handle once close() actually
-    // succeeds. Swallowing a failed terminate AND dropping the handle is a
-    // recurring review finding: the microVM keeps running, the failure reads as
-    // success, and no later call can retry. So on failure we keep the handle
-    // (isReady() stays true) and re-throw; a subsequent destroy() retries.
+    // If an init() is still in flight, let it settle first: otherwise destroy()
+    // sees no session, no-ops, and the microVM that create() returns moments
+    // later is assigned to a handle nobody holds — a leak. Awaiting adopts that
+    // session so we actually tear it down (or it already cleaned up on failure).
+    if (this.initPromise) {
+      await this.initPromise.catch(() => {});
+    }
+
+    // Terminate the session, clearing the handle only once teardown succeeds.
+    // Swallowing a failed terminate AND dropping the handle is a review finding
+    // (the VM keeps running, the failure reads as success, nothing can retry) —
+    // so on a transient failure we keep the handle and re-throw for retry. But
+    // use closeIfOpen(): an already-terminated sandbox (hit its max-duration,
+    // GC'd server-side) is the desired end state, not a retryable error, so it
+    // must not throw and wedge the session as permanently undeletable.
     if (this.session) {
       console.log("[TenkiExecutor] Destroying sandbox...");
-      await this.session.close(); // close() terminates the session; may throw
+      await this.session.closeIfOpen(); // no-ops if already gone; throws only on transient failure
       this.session = null;
     }
     // Release the client's control-plane channel only once no session remains

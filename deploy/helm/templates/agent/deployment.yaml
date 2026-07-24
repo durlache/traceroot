@@ -71,6 +71,9 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.llmKeys.existingSecret }}
                   key: {{ .Values.llmKeys.keys.tenkiApiKey }}
+                  # Optional: Tenki is opt-in and new, so a Secret without this
+                  # key must not break upgrades for existing (non-Tenki) installs.
+                  optional: true
             {{- end }}
             {{- end }}
             {{- end }}

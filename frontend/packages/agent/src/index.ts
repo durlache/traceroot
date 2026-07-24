@@ -89,8 +89,18 @@ app.get("/api/v1/projects/:projectId/sessions/:sessionId/messages", async (c) =>
 });
 
 app.delete("/api/v1/projects/:projectId/sessions/:sessionId", async (c) => {
+  const projectId = c.req.param("projectId");
   const sessionId = c.req.param("sessionId");
   const userId = c.req.header("x-user-id") || "";
+
+  // Authorize BEFORE any destructive action (mirrors POST /messages). Without
+  // this, a caller with a valid sessionId but the wrong user would tear down the
+  // owner's live sandbox and abort their in-flight session, and only then get a
+  // 404 — the ownership check used to live solely inside deleteSession() below.
+  const ownedSession = await getSession(sessionId, userId, projectId);
+  if (!ownedSession) {
+    return c.json({ error: "not found" }, 404);
+  }
 
   // Destroy the sandbox first. If teardown fails we must NOT delete the DB
   // session or return success: doing so tells the client it's done while the
