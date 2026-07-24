@@ -221,6 +221,10 @@ EOT
   # Feature flags
   feature_values = "enableBilling: \"${var.enable_billing}\""
 
+  # Sandbox provider selection (chart defaults to daytona; render explicitly so
+  # setting tenki_api_key alone isn't silently ignored).
+  sandbox_values = "sandboxProvider: \"${var.sandbox_provider}\""
+
   # Additional env vars (escape hatch)
   additional_env_values = length(var.additional_env) == 0 ? "" : <<EOT
 additionalEnv:
@@ -278,6 +282,7 @@ resource "helm_release" "traceroot" {
     local.smtp_values,
     local.enterprise_values,
     local.feature_values,
+    local.sandbox_values,
     local.additional_env_values,
     local.clickhouse_log_table_overrides,
   ])

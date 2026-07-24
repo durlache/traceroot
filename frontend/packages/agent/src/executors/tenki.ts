@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { TenkiSandbox } from "@tenkicloud/sandbox";
-import type { Session } from "@tenkicloud/sandbox";
+import type { Session, ProcessRunHandle } from "@tenkicloud/sandbox";
 import type { Executor, ExecResult, ExecOptions } from "./interface.js";
 
 // Lifetime backstops (env-overridable). A finite maxDuration is the last-resort
@@ -22,24 +22,43 @@ const DEFAULT_EXEC_TIMEOUT_SECS = Number(process.env.TENKI_EXEC_TIMEOUT_SECS) ||
 // `await proc` would otherwise never settle.
 const HOST_TIMEOUT_GRACE_SECS = 30;
 
-/** Drain a byte stream to a single buffer (the SDK exposes stdout/stderr as streams). */
-async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+// Cap retained stdout/stderr per stream (parity with DockerExecutor). We keep
+// draining past this so the guest process never blocks on a full pipe, but a
+// noisy command can't grow the agent's memory without bound.
+const MAX_OUTPUT_BYTES = 10 * 1024 * 1024; // 10MB
+
+// Root-side recursive tree-kill (post-order: children before parent, so nothing
+// reparents mid-walk). proc.kill() only reaps the direct child, leaving the
+// sudo'd timeout→bash→command tree orphaned but alive (verified live); this
+// runs as root because those processes are root-owned. $TARGET_PID is passed
+// out-of-band via env, never interpolated.
+const TREE_KILL_SCRIPT =
+  'kt(){ for c in $(pgrep -P "$1" 2>/dev/null); do kt "$c"; done; kill -KILL "$1" 2>/dev/null; }; kt "$TARGET_PID"';
+
+/**
+ * Drain a byte stream to completion (so the guest process never blocks on a full
+ * pipe) while retaining at most `capBytes`.
+ */
+async function readAll(stream: ReadableStream<Uint8Array>, capBytes: number): Promise<Uint8Array> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
-  let total = 0;
+  let retained = 0;
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (value) {
-        chunks.push(value);
-        total += value.length;
+      if (value && retained < capBytes) {
+        const slice =
+          retained + value.length <= capBytes ? value : value.subarray(0, capBytes - retained);
+        chunks.push(slice);
+        retained += slice.length;
       }
+      // beyond the cap: keep reading to drain, but discard
     }
   } finally {
     reader.releaseLock();
   }
-  const out = new Uint8Array(total);
+  const out = new Uint8Array(retained);
   let offset = 0;
   for (const c of chunks) {
     out.set(c, offset);
@@ -210,14 +229,19 @@ export class TenkiExecutor implements Executor {
     const argv = ["sudo", "-E", "timeout", String(timeoutSecs), "bash", "-lc", scoped];
 
     const proc = this.session.run(argv, { env: options?.env });
+    // This executor never sends stdin; close it so commands that read stdin
+    // (e.g. `cat`) see EOF immediately instead of blocking until the timeout.
+    void proc.stdin.close().catch(() => {});
 
     let onAbort: (() => void) | undefined;
     const aborted = signal
       ? new Promise<never>((_, reject) => {
           onAbort = () => {
-            // Real cancellation: kill the guest process, then unblock the caller.
-            void proc.kill().catch(() => {});
-            reject(asAbortError(signal.reason));
+            // Real cancellation: reap the whole guest process tree (proc.kill()
+            // alone orphans the sudo'd children — verified live), and only reject
+            // once that's done so the caller doesn't unblock while work continues.
+            // If the reaper stalls, the host deadline below still rejects the race.
+            void this.reapTree(proc).finally(() => reject(asAbortError(signal.reason)));
           };
           signal.addEventListener("abort", onAbort, { once: true });
         })
@@ -241,16 +265,25 @@ export class TenkiExecutor implements Executor {
 
     const collect = (async () => {
       const [stdoutBuf, stderrBuf] = await Promise.all([
-        readAll(proc.stdout),
-        readAll(proc.stderr),
+        readAll(proc.stdout, MAX_OUTPUT_BYTES),
+        readAll(proc.stderr, MAX_OUTPUT_BYTES),
       ]);
       const result = await proc;
       return { stdoutBuf, stderrBuf, result };
     })();
 
+    // Reaping the tree on abort closes the streams, so `collect` resolves with
+    // the killed command's result. That must NOT win the race — an aborted call
+    // rejects, it doesn't return a partial result. When the signal is set, hand
+    // the race a never-settling stand-in so `aborted` (which rejects only after
+    // reapTree finishes) is the outcome.
+    const guardedCollect = collect.then((r) =>
+      signal?.aborted ? new Promise<typeof r>(() => {}) : r,
+    );
+
     try {
       const { stdoutBuf, stderrBuf, result } = await Promise.race(
-        aborted ? [collect, hostDeadline, aborted] : [collect, hostDeadline],
+        aborted ? [guardedCollect, hostDeadline, aborted] : [guardedCollect, hostDeadline],
       );
 
       // Decode the raw bytes WITHOUT trimming. The SDK's stdoutText/stderrText
@@ -278,6 +311,25 @@ export class TenkiExecutor implements Executor {
     } finally {
       if (hostTimer) clearTimeout(hostTimer);
       if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  // Terminate the whole guest process tree spawned for `proc`, as root, before it
+  // can orphan — proc.kill() alone reaps only the direct child, leaving the
+  // sudo'd timeout→bash→command subtree running (verified live).
+  private async reapTree(proc: ProcessRunHandle): Promise<void> {
+    try {
+      if (!this.session) return;
+      const pid = await proc.pid;
+      const killer = this.session.run(["sudo", "-E", "bash", "-c", TREE_KILL_SCRIPT], {
+        env: { TARGET_PID: String(pid) },
+      });
+      void killer.stdin.close().catch(() => {});
+      await killer;
+    } catch {
+      // best-effort — the caller unblocks regardless, and the host deadline backstops
+    } finally {
+      await proc.kill().catch(() => {});
     }
   }
 

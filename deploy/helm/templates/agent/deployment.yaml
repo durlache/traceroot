@@ -65,15 +65,15 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.llmKeys.existingSecret }}
                   key: {{ .Values.llmKeys.keys.daytonaApiKey }}
-            {{- if .Values.llmKeys.keys.tenkiApiKey }}
+            {{- if eq .Values.sandboxProvider "tenki" }}
+            # Rendered only when Tenki is the selected provider, so existing
+            # (non-Tenki) installs never reference this key on upgrade — and it is
+            # required here, failing fast at startup rather than on first tool use.
             - name: TENKI_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.llmKeys.existingSecret }}
                   key: {{ .Values.llmKeys.keys.tenkiApiKey }}
-                  # Optional: Tenki is opt-in and new, so a Secret without this
-                  # key must not break upgrades for existing (non-Tenki) installs.
-                  optional: true
             {{- end }}
             {{- end }}
             {{- end }}

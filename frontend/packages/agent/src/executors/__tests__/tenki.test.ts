@@ -58,7 +58,7 @@ function runHandle(r: RunResult = {}) {
     pid: Promise.resolve(1),
     stdout: streamOf(stdout),
     stderr: streamOf(stderr),
-    stdin: { close: () => Promise.resolve() },
+    stdin: { close: vi.fn().mockResolvedValue(undefined) },
     signal: vi.fn().mockResolvedValue(undefined),
     kill: vi.fn().mockResolvedValue(undefined),
     // PromiseLike<ProcessRunResult>
@@ -73,10 +73,57 @@ function hangingRunHandle() {
     pid: Promise.resolve(1),
     stdout: new ReadableStream<Uint8Array>({ start() {} }),
     stderr: new ReadableStream<Uint8Array>({ start() {} }),
-    stdin: { close: () => Promise.resolve() },
+    stdin: { close: vi.fn().mockResolvedValue(undefined) },
     signal: vi.fn().mockResolvedValue(undefined),
     kill: vi.fn().mockResolvedValue(undefined),
     then: () => new Promise(() => {}),
+  };
+}
+
+/**
+ * A handle that stays open until kill(), which then closes the streams and
+ * resolves with a killed result — modeling REAL Tenki behavior. This is what
+ * exposes the "abort resolves instead of rejecting" bug: reaping closes the
+ * streams, so a naive race lets the killed result resolve the call.
+ */
+function killableRunHandle() {
+  let closeOut = () => {};
+  let closeErr = () => {};
+  const stdout = new ReadableStream<Uint8Array>({
+    start(c) {
+      closeOut = () => c.close();
+    },
+  });
+  const stderr = new ReadableStream<Uint8Array>({
+    start(c) {
+      closeErr = () => c.close();
+    },
+  });
+  const result = {
+    exitCode: 137,
+    stdout: enc(""),
+    stderr: enc(""),
+    signal: "KILL",
+    reason: "signaled",
+    durationMs: 1,
+  };
+  let resolveDone: (v: typeof result) => void = () => {};
+  const done = new Promise<typeof result>((res) => {
+    resolveDone = res;
+  });
+  return {
+    pid: Promise.resolve(1),
+    stdout,
+    stderr,
+    stdin: { close: vi.fn().mockResolvedValue(undefined) },
+    signal: vi.fn().mockResolvedValue(undefined),
+    kill: vi.fn().mockImplementation(async () => {
+      closeOut();
+      closeErr();
+      resolveDone(result);
+    }),
+    then: (onF: (v: typeof result) => unknown, onR?: (e: unknown) => unknown) =>
+      done.then(onF, onR),
   };
 }
 
@@ -256,17 +303,56 @@ describe("TenkiExecutor", () => {
       expect(result.stdout).toBe(body);
     });
 
-    it("cancels the guest process via kill() when the signal aborts", async () => {
+    it("closes stdin so commands that read stdin see EOF instead of hanging", async () => {
+      await executor.init();
+      const handle = runHandle({ stdout: "" });
+      mockSession.run.mockReturnValueOnce(handle);
+      await executor.exec("cat");
+      expect(handle.stdin.close).toHaveBeenCalled();
+    });
+
+    it("caps retained output at 10MB while still draining the stream", async () => {
+      await executor.init();
+      const big = "x".repeat(11 * 1024 * 1024); // 11MB > cap
+      mockSession.run.mockReturnValueOnce(runHandle({ stdout: big }));
+      const result = await executor.exec("noisy");
+      expect(result.stdout.length).toBe(10 * 1024 * 1024);
+    });
+
+    it("on abort, reaps the guest process TREE as root, then kills the handle", async () => {
+      // proc.kill() alone only reaps the direct child; the sudo'd tree orphans
+      // and keeps running (verified live). So abort must issue a root tree-kill
+      // rooted at the guest PID before rejecting.
       await executor.init();
       const handle = hangingRunHandle();
-      mockSession.run.mockReturnValueOnce(handle);
+      mockSession.run.mockReturnValueOnce(handle); // the exec; the reaper uses the default run mock
 
       const ac = new AbortController();
       const p = executor.exec("sleep 999", { signal: ac.signal });
       ac.abort();
 
       await expect(p).rejects.toThrow();
+      const reaper = (mockSession.run.mock.calls as RunCall[]).find((c) =>
+        c[0].at(-1)?.includes("pgrep -P"),
+      );
+      expect(reaper).toBeTruthy();
+      expect(reaper![0].slice(0, 2)).toEqual(["sudo", "-E"]); // runs as root
+      expect(reaper![1].env).toHaveProperty("TARGET_PID");
       expect(handle.kill).toHaveBeenCalled();
+    });
+
+    it("rejects on abort even when reaping closes the streams (no killed-result resolve)", async () => {
+      // Real Tenki closes the command's streams once it's killed, so `collect`
+      // resolves with a killed result. The call must still REJECT (cancelled),
+      // not resolve with that result. (This is the live bug the hanging-handle
+      // test missed.)
+      await executor.init();
+      const handle = killableRunHandle();
+      mockSession.run.mockReturnValueOnce(handle);
+      const ac = new AbortController();
+      const p = executor.exec("sleep 999", { signal: ac.signal });
+      ac.abort();
+      await expect(p).rejects.toThrow(); // must reject, never resolve to code 137
     });
 
     it("throws immediately and never runs when the signal is already aborted", async () => {
