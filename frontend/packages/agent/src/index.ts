@@ -92,11 +92,18 @@ app.delete("/api/v1/projects/:projectId/sessions/:sessionId", async (c) => {
   const sessionId = c.req.param("sessionId");
   const userId = c.req.header("x-user-id") || "";
 
-  // Destroy executor if one exists for this session
+  // Destroy executor if one exists for this session. Only forget it once
+  // teardown succeeds — a failed destroy() (e.g. a sandbox terminate that didn't
+  // land) keeps the executor registered so a later delete can retry, rather than
+  // leaking the runtime.
   const executor = sessionExecutors.get(sessionId);
   if (executor) {
-    await executor.destroy();
-    sessionExecutors.delete(sessionId);
+    try {
+      await executor.destroy();
+      sessionExecutors.delete(sessionId);
+    } catch (err) {
+      console.error(`[Agent] destroy failed for session ${sessionId}; retained for retry`, err);
+    }
   }
 
   removeAgent(sessionId);
@@ -305,10 +312,15 @@ async function shutdown(signal: string): Promise<void> {
   isShuttingDown = true;
   console.log(`\n[Agent] Received ${signal}, shutting down...`);
   try {
-    // Destroy all active executors (sandbox containers)
+    // Destroy all active executors (sandbox containers). Best-effort per
+    // executor: one failed teardown must not strand the rest.
     for (const [id, executor] of sessionExecutors) {
-      await executor.destroy();
-      sessionExecutors.delete(id);
+      try {
+        await executor.destroy();
+        sessionExecutors.delete(id);
+      } catch (err) {
+        console.error(`[Agent] destroy failed for session ${id} during shutdown`, err);
+      }
     }
     await prisma.$disconnect();
     console.log("[Agent] Cleanup complete");

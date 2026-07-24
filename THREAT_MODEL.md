@@ -18,13 +18,13 @@ TraceRoot is an open-source observability and self-healing platform for AI agent
 | **Browser client** | Next.js (TypeScript) | Web UI — trace explorer, debugger, onboarding |
 | **REST API** | FastAPI (Python) | Core backend — trace ingestion, trace reads, and internal service APIs; user-scoped reads are authorised via Next.js session headers |
 | **Celery worker** | Python / Redis | Async task queue — trace ingestion and detector trigger evaluation |
-| **TS agent service** | TypeScript (`frontend/packages/agent/`) | Drives the Daytona sandbox for AI debugging; runs `executors/daytona.ts` and `tools/sandbox.ts` |
+| **TS agent service** | TypeScript (`frontend/packages/agent/`) | Drives the sandbox for AI debugging; the runtime is pluggable via `SANDBOX_PROVIDER` (`executors/{docker,daytona,tenki}.ts`) and `tools/sandbox.ts` |
 | **ClickHouse** | ClickHouse DB | Columnar store for traces and spans |
 | **Redis** | Redis | Task queue broker + short-lived caching |
 | **Object storage** | AWS S3 | Trace payload storage for large spans |
 | **Python SDK** | `traceroot` PyPI package | Installed in user's agent; instruments LLM calls via OpenTelemetry |
 | **TypeScript SDK** | `@traceroot-ai/traceroot` npm package | Installed in user's agent; instruments LLM calls via OpenTelemetry |
-| **Daytona sandbox** | Containerised runtime | Isolated environment for AI agentic debugging with access to user source code |
+| **Sandbox runtime** | Containerised (Docker, Daytona) or hardware-virtualised microVM (Tenki), selected by `SANDBOX_PROVIDER` | Isolated, ephemeral environment for AI agentic debugging with access to user source code |
 | **GitHub integration** | GitHub App + OAuth linking flow | Uses short-lived installation tokens to read commits, PRs, and issues for root cause correlation |
 
 ### Deployment Surfaces
@@ -51,7 +51,7 @@ TraceRoot is an open-source observability and self-healing platform for AI agent
 [ TS Agent Service ]         <-- separate process (frontend/packages/agent/)
         |  sandbox API
         v
-[ Daytona Sandbox ]          <-- trust boundary: ephemeral container, no persistent state
+[ Sandbox: Docker/Daytona/Tenki ] <-- trust boundary: ephemeral runtime, no persistent state
         |  GitHub API
         v
 [ User's GitHub Repo ]       <-- trust boundary: GitHub App installation token scope
@@ -132,7 +132,7 @@ Threats are categorised using **STRIDE**. Each threat maps to a component and a 
 | T-03 | SDK packages are published from CI in their respective SDK repositories (`traceroot-py` for PyPI, `traceroot-ts` for npm); contributors sign CLA |
 | I-01 | (no mitigation in place — see Known Gaps) |
 | I-03 | Tenant isolation by `project_id` in ClickHouse queries |
-| E-02 | Daytona sandbox is ephemeral and containerised, limiting blast radius |
+| E-02 | Sandbox is ephemeral and isolated — containerised (Docker/Daytona) or a hardware-virtualised microVM (Tenki) — limiting blast radius |
 
 ### 3.2 Known Gaps and Recommended Actions
 
@@ -173,7 +173,7 @@ Use this checklist when reviewing a PR or doing a quarterly security review.
 - [ ] Contributors agree to the CLA before merge
 
 ### Sandboxing
-- [ ] Daytona sandbox is ephemeral — no state persists between sessions
+- [ ] Sandbox (Docker/Daytona/Tenki) is ephemeral — no state persists between sessions
 - [ ] User source code is deleted from the sandbox after session ends
 - [ ] AI prompt construction sanitises trace payloads to prevent prompt injection
 
