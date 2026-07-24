@@ -370,6 +370,8 @@ services:
       # --- Sandbox ---
       SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
       DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
+      TENKI_API_KEY: ${TENKI_API_KEY:-}
+      TENKI_WORKSPACE_ID: ${TENKI_WORKSPACE_ID:-}
       # --- AI keys ---
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}

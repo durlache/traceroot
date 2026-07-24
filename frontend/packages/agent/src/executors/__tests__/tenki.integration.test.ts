@@ -52,6 +52,20 @@ const TWO_MIN = 120_000;
       const ls = await executor.exec("ls /workspace/repos/hw/.git");
       expect(ls.code).toBe(0);
 
+      // aborting actually interrupts the guest process. The SDK ignores the
+      // signal, so without executor-level cancellation this `sleep 30` would
+      // resolve normally after 30s instead of rejecting (the bug reported in
+      // review). With the kill()-on-abort fix it rejects promptly.
+      const ac = new AbortController();
+      const slow = executor.exec("sleep 30", { signal: ac.signal });
+      setTimeout(() => ac.abort(), 500);
+      const start = Date.now();
+      await expect(slow).rejects.toThrow();
+      expect(Date.now() - start).toBeLessThan(15_000); // nowhere near the 30s command
+
+      // and the sandbox is still usable after a cancelled command
+      expect((await executor.exec("echo alive")).stdout.trim()).toBe("alive");
+
       await executor.destroy();
       expect(executor.isReady()).toBe(false);
     },

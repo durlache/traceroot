@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// Mock the Tenki SDK
+// Mock the Tenki SDK. The executor drives commands through the low-level
+// `session.run()` handle (so it can cancel), so the mock models that handle.
 const mockSession = {
   id: "sbx-test",
-  exec: vi.fn(),
+  run: vi.fn(),
   writeFile: vi.fn(),
   readFile: vi.fn(),
   close: vi.fn(),
@@ -17,15 +18,72 @@ const mockClient = {
 
 vi.mock("@tenkicloud/sandbox", () => ({
   TenkiSandbox: vi.fn().mockImplementation(() => mockClient),
-  stdoutText: (r: { stdout: string }) => r.stdout ?? "",
-  stderrText: (r: { stderr: string }) => r.stderr ?? "",
-  isSuccess: (status: string) => status === "SUCCEEDED",
 }));
 
 import { TenkiExecutor } from "../tenki.js";
 
-/** The exec wrapper always calls session.exec("sudo", { args, env, ... }). */
-type ExecCall = [string, { args: string[]; env?: Record<string, string>; timeoutMs?: number }];
+const enc = (s: string) => new TextEncoder().encode(s);
+
+/** A ReadableStream that emits `text` (if any) then closes. */
+function streamOf(text: string): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (text) controller.enqueue(enc(text));
+      controller.close();
+    },
+  });
+}
+
+type RunResult = {
+  exitCode?: number;
+  stdout?: string;
+  stderr?: string;
+  signal?: string;
+  reason?: string;
+};
+
+/** Build a ProcessRunHandle-like mock that resolves to a ProcessRunResult. */
+function runHandle(r: RunResult = {}) {
+  const { exitCode = 0, stdout = "", stderr = "", signal, reason } = r;
+  const result = {
+    exitCode,
+    stdout: enc(stdout),
+    stderr: enc(stderr),
+    signal,
+    reason,
+    durationMs: 1,
+  };
+  return {
+    pid: Promise.resolve(1),
+    stdout: streamOf(stdout),
+    stderr: streamOf(stderr),
+    stdin: { close: () => Promise.resolve() },
+    signal: vi.fn().mockResolvedValue(undefined),
+    kill: vi.fn().mockResolvedValue(undefined),
+    // PromiseLike<ProcessRunResult>
+    then: (onF: (v: typeof result) => unknown, onR?: (e: unknown) => unknown) =>
+      Promise.resolve(result).then(onF, onR),
+  };
+}
+
+/** A handle whose streams never close and never resolves — used to test cancellation. */
+function hangingRunHandle() {
+  return {
+    pid: Promise.resolve(1),
+    stdout: new ReadableStream<Uint8Array>({ start() {} }),
+    stderr: new ReadableStream<Uint8Array>({ start() {} }),
+    stdin: { close: () => Promise.resolve() },
+    signal: vi.fn().mockResolvedValue(undefined),
+    kill: vi.fn().mockResolvedValue(undefined),
+    then: () => new Promise(() => {}),
+  };
+}
+
+/** session.run is always called as run(argv, { env }). */
+type RunCall = [string[], { env?: Record<string, string> }];
+
+const lastRun = () => mockSession.run.mock.lastCall as RunCall;
+const runCmds = () => (mockSession.run.mock.calls as RunCall[]).map((c) => c[0].at(-1));
 
 describe("TenkiExecutor", () => {
   let executor: TenkiExecutor;
@@ -36,16 +94,12 @@ describe("TenkiExecutor", () => {
     delete process.env.TENKI_WORKSPACE_ID;
     executor = new TenkiExecutor();
 
-    // Default mock returns (SDK 0.4.0: whoAmI workspaces carry projects[]).
+    // Default mocks (SDK 0.4.0: whoAmI workspaces carry projects[]).
+    mockClient.create.mockResolvedValue(mockSession);
     mockClient.whoAmI.mockResolvedValue({
       workspaces: [{ id: "ws-1", name: "default", projects: [{ id: "proj-123" }] }],
     });
-    mockSession.exec.mockResolvedValue({
-      exitCode: 0,
-      stdout: "",
-      stderr: "",
-      status: "SUCCEEDED",
-    });
+    mockSession.run.mockImplementation(() => runHandle());
   });
 
   describe("init()", () => {
@@ -63,7 +117,6 @@ describe("TenkiExecutor", () => {
           maxDurationMs: 2 * 60 * 60 * 1000, // finite backstop, not 600s
         }),
       );
-      // workDir is always /workspace, consistent with Docker/Daytona executors
       expect(executor.getWorkspacePath()).toBe("/workspace");
       expect(executor.isReady()).toBe(true);
     });
@@ -80,9 +133,7 @@ describe("TenkiExecutor", () => {
 
     it("creates the /workspace layout at init", async () => {
       await executor.init();
-
-      const cmds = (mockSession.exec.mock.calls as ExecCall[]).map((c) => c[1].args.at(-1));
-      expect(cmds.some((c) => c?.includes("mkdir -p /workspace/repos"))).toBe(true);
+      expect(runCmds().some((c) => c?.includes("mkdir -p /workspace/repos"))).toBe(true);
     });
 
     it("throws when no project is visible for the key", async () => {
@@ -91,8 +142,6 @@ describe("TenkiExecutor", () => {
     });
 
     it("refuses to guess when multiple projects are visible", async () => {
-      // Silently picking the first of many is the footgun the sibling Tenki
-      // PRs were told to fix — ambiguity must point at the override instead.
       mockClient.whoAmI.mockResolvedValueOnce({
         workspaces: [{ id: "w1", name: "a", projects: [{ id: "p1" }, { id: "p2" }] }],
       });
@@ -112,21 +161,24 @@ describe("TenkiExecutor", () => {
       expect(mockClient.create).toHaveBeenCalledWith(expect.objectContaining({ projectId: "p2" }));
     });
 
-    it("is idempotent — a second init() does not create a second sandbox", async () => {
+    it("is idempotent — a second init() after success does not create another sandbox", async () => {
       await executor.init();
       await executor.init();
       expect(mockClient.create).toHaveBeenCalledTimes(1);
     });
 
+    it("is single-flight under concurrent first use — one sandbox, not two", async () => {
+      // Two overlapping first calls must share one initialization, or each would
+      // create a microVM and destroy() could only reach one (reproduced live).
+      const [a, b] = [executor.init(), executor.init()];
+      await Promise.all([a, b]);
+      expect(mockClient.create).toHaveBeenCalledTimes(1);
+    });
+
     it("tears the sandbox down if post-create setup fails (no leak)", async () => {
-      // create() succeeded, so a later failure must terminate the session rather
-      // than leak a running microVM until its idle timeout.
-      mockSession.exec.mockResolvedValueOnce({
-        exitCode: 1,
-        stdout: "",
-        stderr: "mkdir: permission denied",
-        status: "FAILED",
-      });
+      mockSession.run.mockImplementationOnce(() =>
+        runHandle({ exitCode: 1, stderr: "mkdir: permission denied" }),
+      );
 
       await expect(executor.init()).rejects.toThrow(/workspace setup failed/);
       expect(mockSession.close).toHaveBeenCalled();
@@ -137,96 +189,99 @@ describe("TenkiExecutor", () => {
     it("releases the client if project resolution fails before create", async () => {
       mockClient.whoAmI.mockResolvedValueOnce({ workspaces: [] });
       await expect(executor.init()).rejects.toThrow(/no project visible/);
-      // No session was created, but the client's control-plane channel is closed.
       expect(mockClient.close).toHaveBeenCalled();
       expect(mockClient.create).not.toHaveBeenCalled();
     });
   });
 
   describe("exec()", () => {
-    it("runs commands as root via sudo -E bash -lc and maps the result", async () => {
+    it("runs commands as root via sudo -E … bash -lc and maps the result", async () => {
       await executor.init();
-      mockSession.exec.mockResolvedValueOnce({
-        exitCode: 0,
-        stdout: "hello world",
-        stderr: "warn",
-        status: "SUCCEEDED",
-      });
+      mockSession.run.mockImplementationOnce(() =>
+        runHandle({ exitCode: 0, stdout: "hello world", stderr: "warn" }),
+      );
 
       const result = await executor.exec("echo hello world");
 
       expect(result).toEqual({ stdout: "hello world", stderr: "warn", code: 0 });
-      const [program, opts] = mockSession.exec.mock.lastCall as ExecCall;
-      expect(program).toBe("sudo");
-      expect(opts.args).toEqual(["-E", "bash", "-lc", "echo hello world"]);
+      const [argv] = lastRun();
+      expect(argv.slice(0, 2)).toEqual(["sudo", "-E"]);
+      expect(argv.slice(-2)).toEqual(["-lc", "echo hello world"]);
     });
 
-    it("enforces timeout in-guest via coreutils timeout (SDK timeoutMs is only a backstop)", async () => {
+    it("always bounds execution in-guest with coreutils timeout (default when none given)", async () => {
       await executor.init();
+      await executor.exec("do thing");
+      const [argv] = lastRun();
+      expect(argv).toEqual(["sudo", "-E", "timeout", "900", "bash", "-lc", "do thing"]);
+    });
 
+    it("uses the caller's timeout when supplied", async () => {
+      await executor.init();
       await executor.exec("sleep 1", { timeout: 10 });
-
-      const [, opts] = mockSession.exec.mock.lastCall as ExecCall;
-      expect(opts.args).toEqual(["-E", "timeout", "10", "bash", "-lc", "sleep 1"]);
-      expect(opts.timeoutMs).toBe(40_000); // (timeout + 30s) backstop
+      const [argv] = lastRun();
+      expect(argv).toEqual(["sudo", "-E", "timeout", "10", "bash", "-lc", "sleep 1"]);
     });
 
     it("passes env out-of-band, never in the command string", async () => {
       await executor.init();
-
       await executor.exec('echo "$SECRET"', { env: { SECRET: "s3cr3t" } });
-
-      const [, opts] = mockSession.exec.mock.lastCall as ExecCall;
+      const [argv, opts] = lastRun();
       expect(opts.env).toEqual({ SECRET: "s3cr3t" });
-      expect(opts.args.at(-1)).not.toContain("s3cr3t");
+      expect(argv.at(-1)).not.toContain("s3cr3t");
     });
 
-    it("does not let a timed-out command (exitCode 0, TIMED_OUT) read as success", async () => {
+    it("preserves exact output — no trimming of indentation/whitespace", async () => {
       await executor.init();
-      mockSession.exec.mockResolvedValueOnce({
-        exitCode: 0,
-        stdout: "",
-        stderr: "",
-        status: "TIMED_OUT",
-      });
+      const body = "  indented first line\nsecond\n\n"; // leading indent + trailing blank line
+      mockSession.run.mockImplementationOnce(() => runHandle({ stdout: body }));
+      const result = await executor.exec("cat file");
+      expect(result.stdout).toBe(body);
+    });
 
-      const result = await executor.exec("sleep 999");
+    it("cancels the guest process via kill() when the signal aborts", async () => {
+      await executor.init();
+      const handle = hangingRunHandle();
+      mockSession.run.mockReturnValueOnce(handle);
 
-      expect(result.code).toBe(124);
-      expect(result.stderr).toBe("command timed_out"); // status folded in only when there's no other output
+      const ac = new AbortController();
+      const p = executor.exec("sleep 999", { signal: ac.signal });
+      ac.abort();
+
+      await expect(p).rejects.toThrow();
+      expect(handle.kill).toHaveBeenCalled();
+    });
+
+    it("throws immediately and never runs when the signal is already aborted", async () => {
+      await executor.init();
+      mockSession.run.mockClear();
+      const ac = new AbortController();
+      ac.abort();
+      await expect(executor.exec("x", { signal: ac.signal })).rejects.toThrow();
+      expect(mockSession.run).not.toHaveBeenCalled();
+    });
+
+    it("does not let a signaled command (exitCode 0) read as success", async () => {
+      await executor.init();
+      mockSession.run.mockImplementationOnce(() =>
+        runHandle({ exitCode: 0, signal: "KILL", reason: "signaled" }),
+      );
+      const result = await executor.exec("run");
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe("command signaled"); // folded in only when no other output
     });
 
     it("does not clobber real output on a status-only failure", async () => {
-      // The clone path merges stderr into stdout (2>&1); a synthetic status
-      // message must not shadow that real diagnostic.
+      // The clone path merges stderr into stdout (2>&1); a synthetic message
+      // must not shadow that real diagnostic.
       await executor.init();
-      mockSession.exec.mockResolvedValueOnce({
-        exitCode: 128,
-        stdout: "fatal: repository not found",
-        stderr: "",
-        status: "FAILED",
-      });
-
+      mockSession.run.mockImplementationOnce(() =>
+        runHandle({ exitCode: 128, stdout: "fatal: repository not found" }),
+      );
       const result = await executor.exec("git clone ...");
-
       expect(result.code).toBe(128);
       expect(result.stdout).toBe("fatal: repository not found");
-      expect(result.stderr).toBe(""); // left empty so the caller reads stdout
-    });
-
-    it("maps a FAILED status with exitCode 0 to a failure", async () => {
-      await executor.init();
-      mockSession.exec.mockResolvedValueOnce({
-        exitCode: 0,
-        stdout: "",
-        stderr: "",
-        status: "FAILED",
-      });
-
-      const result = await executor.exec("run");
-
-      expect(result.code).toBe(1);
-      expect(result.stderr).toBe("command failed");
+      expect(result.stderr).toBe("");
     });
 
     it("throws if not initialized", async () => {
@@ -240,36 +295,25 @@ describe("TenkiExecutor", () => {
     it("stages via native writeFile then moves into place with env-quoted paths", async () => {
       await executor.init();
       vi.clearAllMocks();
-      mockSession.exec.mockResolvedValue({
-        exitCode: 0,
-        stdout: "",
-        stderr: "",
-        status: "SUCCEEDED",
-      });
+      mockSession.run.mockImplementation(() => runHandle());
 
       await executor.writeFile("/tmp/test.txt", "hello");
 
-      // staged into the workdir with a relative path
       const [stagePath, content] = mockSession.writeFile.mock.lastCall as [string, string];
       expect(stagePath).toMatch(/^\.traceroot-stage-/);
       expect(content).toBe("hello");
 
-      // moved with paths in env, not interpolated
-      const [, opts] = mockSession.exec.mock.lastCall as ExecCall;
-      expect(opts.args.at(-1)).toContain('mv "$SRC" "$DEST"');
+      const [argv, opts] = lastRun();
+      expect(argv.at(-1)).toContain('mv "$SRC" "$DEST"');
       expect(opts.env).toMatchObject({ DEST: "/tmp/test.txt" });
       expect(opts.env?.SRC).toContain(stagePath);
     });
 
     it("throws when the move fails", async () => {
       await executor.init();
-      mockSession.exec.mockResolvedValueOnce({
-        exitCode: 1,
-        stdout: "",
-        stderr: "mv: cannot move",
-        status: "FAILED",
-      });
-
+      mockSession.run.mockImplementationOnce(() =>
+        runHandle({ exitCode: 1, stderr: "mv: cannot move" }),
+      );
       await expect(executor.writeFile("/tmp/x", "y")).rejects.toThrow(/writeFile failed/);
     });
 
@@ -282,21 +326,16 @@ describe("TenkiExecutor", () => {
     it("copies into the workdir, reads natively, and cleans up", async () => {
       await executor.init();
       vi.clearAllMocks();
-      mockSession.exec.mockResolvedValue({
-        exitCode: 0,
-        stdout: "",
-        stderr: "",
-        status: "SUCCEEDED",
-      });
+      mockSession.run.mockImplementation(() => runHandle());
       mockSession.readFile.mockResolvedValueOnce(Buffer.from("file contents"));
 
       const result = await executor.readFile("/tmp/test.txt");
 
       expect(result).toBe("file contents");
-      const calls = mockSession.exec.mock.calls as ExecCall[];
-      const cp = calls.find((c) => c[1].args.at(-1)?.includes('cp "$SRC"'));
+      const calls = mockSession.run.mock.calls as RunCall[];
+      const cp = calls.find((c) => c[0].at(-1)?.includes('cp "$SRC"'));
       expect(cp?.[1].env).toMatchObject({ SRC: "/tmp/test.txt" });
-      const rm = calls.find((c) => c[1].args.at(-1)?.includes('rm -f "$DEST"'));
+      const rm = calls.find((c) => c[0].at(-1)?.includes('rm -f "$DEST"'));
       expect(rm).toBeTruthy();
     });
 
@@ -308,25 +347,18 @@ describe("TenkiExecutor", () => {
   describe("cloneRepo()", () => {
     // Same contract as DaytonaExecutor: system `git` CLI + GIT_ASKPASS, token
     // never in argv / URL / .git/config.
-
-    /** Find the exec call that runs `git ... clone` and return [command, env]. */
     function cloneCall(): [string, Record<string, string>] {
-      const call = (mockSession.exec.mock.calls as ExecCall[]).find((c) =>
-        c[1].args.at(-1)?.includes("clone"),
+      const call = (mockSession.run.mock.calls as RunCall[]).find((c) =>
+        c[0].at(-1)?.includes("clone"),
       );
       expect(call).toBeTruthy();
-      return [call![1].args.at(-1)!, call![1].env ?? {}];
+      return [call![0].at(-1)!, call![1].env ?? {}];
     }
 
     it("writes an askpass helper and passes the token via env, never in argv", async () => {
       await executor.init();
       vi.clearAllMocks();
-      mockSession.exec.mockResolvedValue({
-        exitCode: 0,
-        stdout: "",
-        stderr: "",
-        status: "SUCCEEDED",
-      });
+      mockSession.run.mockImplementation(() => runHandle());
 
       await executor.cloneRepo("https://github.com/foo/bar.git", "/repos/bar", {
         ref: "main",
@@ -334,7 +366,6 @@ describe("TenkiExecutor", () => {
         password: "dummy_token",
       });
 
-      // askpass script staged via native writeFile
       const askpassUpload = (mockSession.writeFile.mock.calls as [string, string][]).find((c) =>
         c[1].includes("GIT_PASSWORD"),
       );
@@ -359,12 +390,7 @@ describe("TenkiExecutor", () => {
     it("does not inject shell from a hostile ref", async () => {
       await executor.init();
       vi.clearAllMocks();
-      mockSession.exec.mockResolvedValue({
-        exitCode: 0,
-        stdout: "",
-        stderr: "",
-        status: "SUCCEEDED",
-      });
+      mockSession.run.mockImplementation(() => runHandle());
 
       const hostile = 'main"; rm -rf / #';
       await executor.cloneRepo("https://github.com/foo/bar.git", "/repos/bar", {
@@ -416,18 +442,11 @@ describe("TenkiExecutor", () => {
     it("throws a redacted error when the clone fails", async () => {
       await executor.init();
       vi.clearAllMocks();
-      // Only the `git clone` exec fails; the askpass staging/mv/chmod succeed.
-      mockSession.exec.mockImplementation((_prog: string, opts: { args: string[] }) =>
-        Promise.resolve(
-          opts.args.at(-1)?.includes("clone")
-            ? {
-                exitCode: 128,
-                stdout: "fatal: could not read Password dummy_token",
-                stderr: "",
-                status: "FAILED",
-              }
-            : { exitCode: 0, stdout: "", stderr: "", status: "SUCCEEDED" },
-        ),
+      // Only the `git clone` run fails; askpass staging/mv/chmod succeed.
+      mockSession.run.mockImplementation((argv: string[]) =>
+        argv.at(-1)?.includes("clone")
+          ? runHandle({ exitCode: 128, stdout: "fatal: could not read Password dummy_token" })
+          : runHandle(),
       );
 
       await expect(
@@ -457,21 +476,17 @@ describe("TenkiExecutor", () => {
     });
 
     it("no-ops if not initialized", async () => {
-      await executor.destroy(); // should not throw
+      await executor.destroy();
       expect(mockSession.close).not.toHaveBeenCalled();
     });
 
     it("surfaces a failed terminate and retains the handle for retry", async () => {
-      // A failed terminate must NOT read as success with the handle dropped —
-      // that leaks the microVM permanently. The handle is kept so a later
-      // destroy() can retry.
       await executor.init();
       mockSession.close.mockRejectedValueOnce(new Error("terminate failed"));
 
       await expect(executor.destroy()).rejects.toThrow(/terminate failed/);
-      expect(executor.isReady()).toBe(true); // still tracked
+      expect(executor.isReady()).toBe(true);
 
-      // A retry now succeeds and clears state.
       mockSession.close.mockResolvedValueOnce(undefined);
       await executor.destroy();
       expect(executor.isReady()).toBe(false);

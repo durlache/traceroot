@@ -91,6 +91,7 @@ resource "kubernetes_secret" "llm_keys" {
     "anthropic-api-key" = var.anthropic_api_key
     "openai-api-key"    = var.openai_api_key
     "daytona-api-key"   = var.daytona_api_key
+    "tenki-api-key"     = var.tenki_api_key
   }
 
   depends_on = [module.eks]

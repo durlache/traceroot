@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { TenkiSandbox, stdoutText, stderrText, isSuccess } from "@tenkicloud/sandbox";
+import { TenkiSandbox } from "@tenkicloud/sandbox";
 import type { Session } from "@tenkicloud/sandbox";
 import type { Executor, ExecResult, ExecOptions } from "./interface.js";
 
@@ -11,17 +11,64 @@ import type { Executor, ExecResult, ExecOptions } from "./interface.js";
 const IDLE_TIMEOUT_MINUTES = Number(process.env.TENKI_IDLE_TIMEOUT_MINUTES) || 30;
 const MAX_DURATION_MS = Number(process.env.TENKI_MAX_DURATION_MS) || 2 * 60 * 60 * 1000;
 
+// Every exec is bounded in-guest by coreutils `timeout` (the SDK enforces neither
+// timeoutMs nor the abort signal as of v0.4.0/0.5.0). This ceiling applies when a
+// caller supplies no timeout, so nothing runs unbounded.
+const DEFAULT_EXEC_TIMEOUT_SECS = Number(process.env.TENKI_EXEC_TIMEOUT_SECS) || 900;
+
+/** Drain a byte stream to a single buffer (the SDK exposes stdout/stderr as streams). */
+async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        total += value.length;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.length;
+  }
+  return out;
+}
+
+const asAbortError = (reason: unknown): Error =>
+  reason instanceof Error ? reason : new Error("exec aborted");
+
 export class TenkiExecutor implements Executor {
   private client: TenkiSandbox | null = null;
   private session: Session | null = null;
   private workDir = "";
+  private initPromise: Promise<void> | null = null;
 
   async init(): Promise<void> {
-    // Idempotent: a second init() while a session is live would orphan the first
-    // microVM (a recurring review finding — "repeated start() leaks the previous
-    // sandbox"). Callers guard with isReady(), but the guard belongs here too.
+    // Single-flight: a plain `if (this.session) return` guard is not safe under
+    // concurrent first use — two callers can both pass it during the awaits
+    // before `this.session` is assigned, each create a microVM, and destroy()
+    // can then only reach one (reproduced live in review). Share one in-flight
+    // promise so concurrent callers join the same initialization; already-ready
+    // callers short-circuit. On failure the promise is cleared so a later init()
+    // retries; on success `this.session` is set and this guard short-circuits.
     if (this.session) return;
+    if (!this.initPromise) {
+      this.initPromise = this.doInit().finally(() => {
+        this.initPromise = null;
+      });
+    }
+    return this.initPromise;
+  }
 
+  private async doInit(): Promise<void> {
     console.log("[TenkiExecutor] Creating sandbox...");
 
     // Env-driven auth: TENKI_AUTH_TOKEN, then TENKI_API_KEY (and TENKI_API_ENDPOINT
@@ -100,48 +147,70 @@ export class TenkiExecutor implements Executor {
 
   async exec(command: string, options?: ExecOptions): Promise<ExecResult> {
     if (!this.session) throw new Error("Sandbox not initialized");
+    const signal = options?.signal;
+    if (signal?.aborted) throw asAbortError(signal.reason);
 
-    // Tenki's exec is argv-based and runs as the unprivileged `tenki` user, while
-    // the Docker/Daytona executors run commands as root — `sudo -E` restores that
-    // parity (and -E keeps the out-of-band env, so secrets still never hit argv).
-    // The deadline is enforced in-guest via coreutils `timeout` (exit 124) because
-    // the SDK's timeoutMs is not enforced server-side as of v0.4.0; timeoutMs is
-    // still passed through as a backstop for when that lands.
-    const timeoutSecs = options?.timeout;
-    const args = [
-      "-E",
-      ...(timeoutSecs ? ["timeout", String(timeoutSecs)] : []),
-      "bash",
-      "-lc",
-      command,
-    ];
+    // Run via the low-level handle (not session.exec) so we can actually cancel:
+    // the SDK reads neither ExecOptions.signal nor timeoutMs (v0.4.0/0.5.0), so
+    // exec() bounds every command in-guest with coreutils `timeout` (exit 124)
+    // and enforces the abort signal itself by killing the guest process.
+    //
+    // Commands run as root via `sudo -E`: the Docker/Daytona executors run as
+    // root, and Tenki's guest user is unprivileged `tenki`; -E keeps the
+    // out-of-band env so secrets never hit argv.
+    const timeoutSecs = options?.timeout ?? DEFAULT_EXEC_TIMEOUT_SECS;
+    const argv = ["sudo", "-E", "timeout", String(timeoutSecs), "bash", "-lc", command];
 
-    const result = await this.session.exec("sudo", {
-      args,
-      env: options?.env,
-      timeoutMs: timeoutSecs ? (timeoutSecs + 30) * 1000 : undefined,
-      signal: options?.signal,
-    });
+    const proc = this.session.run(argv, { env: options?.env });
 
-    const stdout = stdoutText(result);
-    let stderr = stderrText(result);
-    let code = result.exitCode ?? 1;
+    let onAbort: (() => void) | undefined;
+    const aborted = signal
+      ? new Promise<never>((_, reject) => {
+          onAbort = () => {
+            // Real cancellation: kill the guest process, then unblock the caller.
+            void proc.kill().catch(() => {});
+            reject(asAbortError(signal.reason));
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+        })
+      : null;
 
-    // Trust the command's status, not exitCode alone: a signaled or timed-out
-    // command can come back with exitCode 0, and reading that as success is a
-    // recurring review finding ("exit_code=0 + SIGKILL reads as success"). When
-    // such a failure carries no output at all, fold the status in so the one
-    // useful diagnostic isn't lost — but never shadow real output (the clone
-    // path merges git's error onto stdout via 2>&1).
-    const ok = isSuccess(result.status);
-    if (!ok && code === 0) {
-      code = result.status === "TIMED_OUT" ? 124 : 1;
+    const collect = (async () => {
+      const [stdoutBuf, stderrBuf] = await Promise.all([
+        readAll(proc.stdout),
+        readAll(proc.stderr),
+      ]);
+      const result = await proc;
+      return { stdoutBuf, stderrBuf, result };
+    })();
+
+    try {
+      const { stdoutBuf, stderrBuf, result } = aborted
+        ? await Promise.race([collect, aborted])
+        : await collect;
+
+      // Decode the raw bytes WITHOUT trimming. The SDK's stdoutText/stderrText
+      // helpers `.trim()`, which would drop leading indentation and trailing
+      // whitespace the `read` tool depends on.
+      const stdout = new TextDecoder().decode(stdoutBuf);
+      let stderr = new TextDecoder().decode(stderrBuf);
+      let code = result.exitCode ?? 1;
+
+      // Trust the outcome, not exitCode alone: a signaled command can report
+      // exitCode 0 ("exit_code=0 + SIGKILL reads as success" was a review
+      // finding). When such a failure carries no output, fold the guest-agent's
+      // reason in so the one useful diagnostic isn't lost — but never shadow
+      // real output (the clone path merges git's error onto stdout via 2>&1).
+      const ok = code === 0 && !result.signal;
+      if (!ok && code === 0) code = 1;
+      if (code !== 0 && !stderr && !stdout) {
+        stderr = result.reason ? `command ${result.reason}` : "command failed";
+      }
+
+      return { stdout, stderr, code };
+    } finally {
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
     }
-    if (code !== 0 && !ok && !stderr && !stdout) {
-      stderr = `command ${result.status.toLowerCase()}`;
-    }
-
-    return { stdout, stderr, code };
   }
 
   getWorkspacePath(): string {

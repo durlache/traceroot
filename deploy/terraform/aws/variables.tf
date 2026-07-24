@@ -163,6 +163,13 @@ variable "daytona_api_key" {
   default     = ""
 }
 
+variable "tenki_api_key" {
+  description = "Tenki API key for sandbox execution (when sandbox_provider = tenki)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 # --- Stripe Billing ---
 variable "stripe_secret_key" {
   description = "Stripe secret key"

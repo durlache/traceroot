@@ -65,6 +65,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.llmKeys.existingSecret }}
                   key: {{ .Values.llmKeys.keys.daytonaApiKey }}
+            {{- if .Values.llmKeys.keys.tenkiApiKey }}
+            - name: TENKI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.llmKeys.existingSecret }}
+                  key: {{ .Values.llmKeys.keys.tenkiApiKey }}
+            {{- end }}
             {{- end }}
             {{- end }}
             {{- with .Values.additionalEnv }}

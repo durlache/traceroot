@@ -92,17 +92,22 @@ app.delete("/api/v1/projects/:projectId/sessions/:sessionId", async (c) => {
   const sessionId = c.req.param("sessionId");
   const userId = c.req.header("x-user-id") || "";
 
-  // Destroy executor if one exists for this session. Only forget it once
-  // teardown succeeds — a failed destroy() (e.g. a sandbox terminate that didn't
-  // land) keeps the executor registered so a later delete can retry, rather than
-  // leaking the runtime.
+  // Destroy the sandbox first. If teardown fails we must NOT delete the DB
+  // session or return success: doing so tells the client it's done while the
+  // runtime keeps running, tracked only by an in-memory handle that a restart
+  // would lose. Instead keep the executor registered AND the session row, and
+  // return a retryable error so the client (or a later delete) reconciles it.
   const executor = sessionExecutors.get(sessionId);
   if (executor) {
     try {
       await executor.destroy();
       sessionExecutors.delete(sessionId);
     } catch (err) {
-      console.error(`[Agent] destroy failed for session ${sessionId}; retained for retry`, err);
+      console.error(
+        `[Agent] destroy failed for session ${sessionId}; keeping session for retry`,
+        err,
+      );
+      return c.json({ error: "sandbox teardown failed; please retry delete" }, 503);
     }
   }
 
@@ -312,17 +317,27 @@ async function shutdown(signal: string): Promise<void> {
   isShuttingDown = true;
   console.log(`\n[Agent] Received ${signal}, shutting down...`);
   try {
-    // Destroy all active executors (sandbox containers). Best-effort per
-    // executor: one failed teardown must not strand the rest.
+    // Destroy all active executors (sandbox runtimes). Best-effort per executor:
+    // one failed teardown must not strand the rest. Track failures so we don't
+    // exit 0 while a sandbox is still running — the leaked ids are logged for
+    // out-of-band reconciliation.
+    const leaked: string[] = [];
     for (const [id, executor] of sessionExecutors) {
       try {
         await executor.destroy();
         sessionExecutors.delete(id);
       } catch (err) {
+        leaked.push(id);
         console.error(`[Agent] destroy failed for session ${id} during shutdown`, err);
       }
     }
     await prisma.$disconnect();
+    if (leaked.length > 0) {
+      console.error(
+        `[Agent] shutdown incomplete — ${leaked.length} sandbox(es) not torn down: ${leaked.join(", ")}`,
+      );
+      process.exit(1);
+    }
     console.log("[Agent] Cleanup complete");
     process.exit(0);
   } catch (error) {

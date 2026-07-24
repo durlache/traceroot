@@ -183,6 +183,8 @@ llmKeys:
     anthropicApiKey: "anthropic-api-key"
     openaiApiKey: "openai-api-key"
     daytonaApiKey: "daytona-api-key"
+    # Secret key holding the Tenki API key (when sandboxProvider: "tenki").
+    tenkiApiKey: "tenki-api-key"
 
 betterAuth:
   url: ""
