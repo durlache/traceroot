@@ -12,8 +12,9 @@ const IDLE_TIMEOUT_MINUTES = Number(process.env.TENKI_IDLE_TIMEOUT_MINUTES) || 3
 const MAX_DURATION_MS = Number(process.env.TENKI_MAX_DURATION_MS) || 2 * 60 * 60 * 1000;
 
 // Every exec is bounded in-guest by coreutils `timeout` (the SDK enforces neither
-// timeoutMs nor the abort signal as of v0.4.0/0.5.0). This ceiling applies when a
-// caller supplies no timeout, so nothing runs unbounded.
+// timeoutMs nor the abort signal — still true in 0.5.1, whose exec() passes
+// neither option through to run()). This ceiling applies when a caller supplies
+// no timeout, so nothing runs unbounded.
 const DEFAULT_EXEC_TIMEOUT_SECS = Number(process.env.TENKI_EXEC_TIMEOUT_SECS) || 900;
 
 // Host-side deadline = the in-guest timeout plus this grace. The in-guest
@@ -75,6 +76,10 @@ export class TenkiExecutor implements Executor {
   private session: Session | null = null;
   private workDir = "";
   private initPromise: Promise<void> | null = null;
+  // Sessions whose close failed during init cleanup. The handles are retained —
+  // dropping them would strand a live VM until the maxDuration backstop while a
+  // retry creates a second one — and every later init()/destroy() retries them.
+  private orphanedSessions: Session[] = [];
 
   async init(): Promise<void> {
     // Single-flight: a plain `if (this.session) return` guard is not safe under
@@ -96,23 +101,27 @@ export class TenkiExecutor implements Executor {
   private async doInit(): Promise<void> {
     console.log("[TenkiExecutor] Creating sandbox...");
 
+    // Retry closing any session a previous failed init could not tear down,
+    // before allocating another VM on top of it.
+    await this.closeOrphans();
+
     // Env-driven auth: TENKI_AUTH_TOKEN, then TENKI_API_KEY (and TENKI_API_ENDPOINT
     // for the base URL). Mirrors DaytonaExecutor's env-key pattern.
     this.client = new TenkiSandbox();
 
-    // Everything after the client exists is failure-atomic: if project
+    // Everything after the client exists is failure-atomic: if workspace
     // resolution, create(), or workspace setup fails, we tear down whatever was
     // allocated rather than leaking a running microVM until its idle timeout.
     // (The sibling Tenki integrations were all flagged for leaking here.)
     try {
-      const projectId = await this.resolveProjectId();
+      const workspaceId = await this.resolveWorkspaceId();
 
       // Default microVM image is Ubuntu 24.04 with git/jq/curl/gh preinstalled, so
       // unlike Daytona there is no runtime apt-get step. Networking defaults to OFF
       // in the SDK — allowOutbound is required for git clone / package installs.
       this.session = await this.client.create({
         name: "traceroot-session",
-        projectId,
+        workspaceId,
         cpuCores: 2,
         memoryMb: 4096,
         allowOutbound: true,
@@ -126,7 +135,11 @@ export class TenkiExecutor implements Executor {
       // cwd to this.workDir and /workspace doesn't exist yet. Only once it exists
       // do we switch, so every later command runs in /workspace — matching the
       // Docker/Daytona executors and the bash tool's advertised working dir.
-      const setup = await this.exec("mkdir -p /workspace/repos /workspace/traces /workspace/notes");
+      // (execRaw, not exec: the public exec() refuses to run until /workspace
+      // is adopted, exactly so nothing else can slip in during this window.)
+      const setup = await this.execRaw(
+        "mkdir -p /workspace/repos /workspace/traces /workspace/notes",
+      );
       if (setup.code !== 0) {
         throw new Error(`TenkiExecutor: workspace setup failed: ${setup.stderr || setup.stdout}`);
       }
@@ -143,22 +156,29 @@ export class TenkiExecutor implements Executor {
     }
   }
 
-  // Best-effort teardown that ALWAYS clears state, used only on the init failure
-  // path. A lingering VM (if closeIfOpen also fails) is bounded by the maxDuration
-  // backstop; the invariant that matters here is that no half-initialized session
-  // survives to satisfy the init/isReady guard.
+  // Teardown that ALWAYS clears the ready-state fields, used only on the init
+  // failure path: no half-initialized session may survive to satisfy the
+  // init/isReady guard. If the close itself fails, the handle is NOT dropped —
+  // it moves to orphanedSessions so the next init()/destroy() can retry the
+  // close instead of stranding a live VM until the maxDuration backstop while
+  // a retry boots a second one.
   private async resetAfterFailedInit(): Promise<void> {
-    try {
-      if (this.session) await this.session.closeIfOpen();
-    } catch (err) {
-      console.warn(
-        "[TenkiExecutor] cleanup after failed init() failed; VM lingers until backstop",
-        err,
-      );
+    if (this.session) {
+      try {
+        await this.session.closeIfOpen();
+      } catch (err) {
+        this.orphanedSessions.push(this.session);
+        console.warn(
+          "[TenkiExecutor] cleanup after failed init() failed; close will be retried on next init()/destroy()",
+          err,
+        );
+      }
+      this.session = null;
     }
-    this.session = null;
     if (this.client) {
       try {
+        // Safe while orphans remain: each Session carries its own RPC client,
+        // so closing this control-plane handle doesn't sever theirs.
         this.client.close();
       } catch {
         // best-effort
@@ -168,46 +188,87 @@ export class TenkiExecutor implements Executor {
     this.workDir = "";
   }
 
-  // Tenki requires a project on create even for single-project accounts. Resolve
-  // it explicitly (TENKI_PROJECT_ID), else from the account. Auto-resolution only
-  // fires when exactly one project is visible: silently picking the first of many
-  // is the footgun the sibling PRs were all told to fix, so ambiguity is a hard
-  // error pointing at the override. TENKI_WORKSPACE_ID narrows a multi-workspace
-  // account first.
-  private async resolveProjectId(): Promise<string> {
-    const explicit = process.env.TENKI_PROJECT_ID;
+  // Retry closing sessions orphaned by a failed init cleanup. Never throws:
+  // callers (init retry, destroy) must proceed regardless; sessions that still
+  // fail stay queued for the next attempt and are bounded by the maxDuration
+  // backstop in the worst case.
+  private async closeOrphans(): Promise<void> {
+    if (this.orphanedSessions.length === 0) return;
+    const stillOrphaned: Session[] = [];
+    for (const session of this.orphanedSessions) {
+      try {
+        await session.closeIfOpen();
+      } catch {
+        stillOrphaned.push(session);
+      }
+    }
+    this.orphanedSessions = stillOrphaned;
+    if (stillOrphaned.length > 0) {
+      console.warn(
+        `[TenkiExecutor] ${stillOrphaned.length} orphaned sandbox(es) still failing to close; ` +
+          "will retry, VM(s) linger until backstop otherwise",
+      );
+    }
+  }
+
+  // Sandboxes are workspace-scoped (SDK 0.5.x removed the project concept).
+  // Resolve the workspace explicitly (TENKI_WORKSPACE_ID), else from the
+  // account. Auto-resolution only fires when exactly one workspace is visible:
+  // silently picking the first of many is the footgun the sibling PRs were all
+  // told to fix, so ambiguity is a hard error pointing at the override.
+  private async resolveWorkspaceId(): Promise<string> {
+    if (process.env.TENKI_PROJECT_ID) {
+      throw new Error(
+        "TenkiExecutor: TENKI_PROJECT_ID is no longer supported (Tenki SDK 0.5.x removed " +
+          "projects); set TENKI_WORKSPACE_ID instead",
+      );
+    }
+    const explicit = process.env.TENKI_WORKSPACE_ID;
     if (explicit) return explicit;
 
     if (!this.client) throw new Error("Sandbox not initialized");
     const identity = await this.client.whoAmI();
+    const workspaces = identity.workspaces ?? [];
 
-    const workspaceFilter = process.env.TENKI_WORKSPACE_ID;
-    const workspaces = (identity.workspaces ?? []).filter(
-      (w) => !workspaceFilter || w.id === workspaceFilter,
-    );
-    const projectIds = workspaces.flatMap((w) => (w.projects ?? []).map((p) => p.id));
-
-    if (projectIds.length === 0) {
-      throw new Error("TenkiExecutor: no project visible for this API key (set TENKI_PROJECT_ID)");
-    }
-    if (projectIds.length > 1) {
+    if (workspaces.length === 0) {
       throw new Error(
-        `TenkiExecutor: multiple projects visible (${projectIds.slice(0, 8).join(", ")}); ` +
-          "set TENKI_PROJECT_ID (or TENKI_WORKSPACE_ID) to disambiguate",
+        "TenkiExecutor: no workspace visible for this API key (set TENKI_WORKSPACE_ID)",
       );
     }
-    return projectIds[0];
+    if (workspaces.length > 1) {
+      throw new Error(
+        `TenkiExecutor: multiple workspaces visible (${workspaces
+          .slice(0, 8)
+          .map((w) => w.id)
+          .join(", ")}); set TENKI_WORKSPACE_ID to disambiguate`,
+      );
+    }
+    return workspaces[0].id;
   }
 
   async exec(command: string, options?: ExecOptions): Promise<ExecResult> {
+    // Require BOTH fields: `session` alone is set mid-init, before /workspace
+    // exists, and a command admitted then would run in /home/tenki instead of
+    // the advertised working dir (reproduced in review under concurrent first
+    // use). isReady() applies the same test, so callers doing
+    // `isReady() || init()` land here only once setup has finished.
+    if (!this.session || !this.workDir) throw new Error("Sandbox not initialized");
+    return this.execRaw(command, options);
+  }
+
+  // exec() without the readiness gate — the init bootstrap must run before
+  // /workspace exists (in the guest default cwd). Everything else goes through
+  // exec().
+  private async execRaw(command: string, options?: ExecOptions): Promise<ExecResult> {
     if (!this.session) throw new Error("Sandbox not initialized");
     const signal = options?.signal;
     if (signal?.aborted) throw asAbortError(signal.reason);
 
     // Run via the low-level handle (not session.exec) so we can actually cancel:
-    // the SDK reads neither ExecOptions.signal nor timeoutMs (v0.4.0/0.5.0), so
-    // exec() bounds every command in-guest with coreutils `timeout` (exit 124)
-    // and enforces the abort signal itself by killing the guest process.
+    // the SDK reads neither ExecOptions.signal nor timeoutMs (verified against
+    // 0.5.1 — exec() forwards neither to run()), so this method bounds every
+    // command in-guest with coreutils `timeout` (exit 124) and enforces the
+    // abort signal itself by killing the guest process.
     //
     // Commands run as root via `sudo -E`: the Docker/Daytona executors run as
     // root, and Tenki's guest user is unprivileged `tenki`; -E keeps the
@@ -374,7 +435,11 @@ export class TenkiExecutor implements Executor {
   }
 
   isReady(): boolean {
-    return this.session !== null;
+    // Not just `session !== null`: the session handle exists before workspace
+    // setup finishes, and reporting ready then lets a concurrent caller skip
+    // init() and exec() in the wrong working directory (review blocker).
+    // workDir is assigned last in doInit, so both set ⇒ fully initialized.
+    return this.session !== null && this.workDir !== "";
   }
 
   async destroy(): Promise<void> {
@@ -385,6 +450,10 @@ export class TenkiExecutor implements Executor {
     if (this.initPromise) {
       await this.initPromise.catch(() => {});
     }
+
+    // Retry any sessions a failed init could not close (never throws — a still-
+    // failing orphan must not block tearing down the live session below).
+    await this.closeOrphans();
 
     // Terminate the session, clearing the handle only once teardown succeeds.
     // Swallowing a failed terminate AND dropping the handle is a review finding

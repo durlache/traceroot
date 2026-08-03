@@ -78,9 +78,13 @@ resource "kubernetes_secret" "github" {
   depends_on = [module.eks]
 }
 
-# LLM API keys secret (conditional — only if any key is provided)
+# LLM API keys secret (conditional — created when ANY of the keys it carries is
+# provided, including the daytona/tenki sandbox keys: a BYOK deployment with only
+# tenki_api_key set still needs this secret or TENKI_API_KEY is never injected).
+# local.llm_keys_enabled is shared with the Helm reference in traceroot.tf so the
+# secret and the chart's existingSecret reference can never diverge.
 resource "kubernetes_secret" "llm_keys" {
-  count = var.anthropic_api_key != "" || var.openai_api_key != "" ? 1 : 0
+  count = local.llm_keys_enabled ? 1 : 0
 
   metadata {
     name      = "traceroot-llm-keys"

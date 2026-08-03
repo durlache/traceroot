@@ -9,7 +9,7 @@ import { TenkiExecutor } from "../tenki.js";
  * Gated on TENKI_API_KEY (or TENKI_AUTH_TOKEN) so CI, which has no credentials,
  * skips it. Run locally with:
  *   TENKI_API_KEY=tk_... pnpm --filter @traceroot/agent exec vitest run tenki.integration
- * Set TENKI_PROJECT_ID (or TENKI_WORKSPACE_ID) if the key sees more than one project.
+ * Set TENKI_WORKSPACE_ID if the key sees more than one workspace.
  */
 const hasCreds = !!(process.env.TENKI_API_KEY || process.env.TENKI_AUTH_TOKEN);
 const TWO_MIN = 120_000;

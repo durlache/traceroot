@@ -193,8 +193,19 @@ EOT
   # GitHub secret reference (conditional)
   github_values = var.github_app_id != "" ? "github:\n  existingSecret: \"traceroot-github\"" : ""
 
-  # LLM keys secret reference (conditional)
-  llm_values = (var.anthropic_api_key != "" || var.openai_api_key != "") ? "llmKeys:\n  existingSecret: \"traceroot-llm-keys\"" : ""
+  # LLM keys secret reference (conditional). The secret also carries the sandbox
+  # provider keys, so a BYOK deployment (no anthropic/openai key at deploy time)
+  # that sets daytona_api_key or tenki_api_key must still create and reference
+  # it — otherwise DAYTONA_API_KEY/TENKI_API_KEY are never injected. This
+  # condition MUST match the `kubernetes_secret.llm_keys` count in secrets.tf;
+  # both use local.llm_keys_enabled to keep them in lockstep.
+  llm_keys_enabled = (
+    var.anthropic_api_key != "" ||
+    var.openai_api_key != "" ||
+    var.daytona_api_key != "" ||
+    var.tenki_api_key != ""
+  )
+  llm_values = local.llm_keys_enabled ? "llmKeys:\n  existingSecret: \"traceroot-llm-keys\"" : ""
 
   # Stripe secret reference (conditional)
   stripe_values = var.stripe_secret_key != "" ? "stripe:\n  existingSecret: \"traceroot-stripe\"" : ""

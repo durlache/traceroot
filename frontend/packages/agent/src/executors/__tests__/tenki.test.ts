@@ -142,22 +142,22 @@ describe("TenkiExecutor", () => {
     delete process.env.TENKI_WORKSPACE_ID;
     executor = new TenkiExecutor();
 
-    // Default mocks (SDK 0.4.0: whoAmI workspaces carry projects[]).
+    // Default mocks (SDK 0.5.x: sandboxes are workspace-scoped; no projects).
     mockClient.create.mockResolvedValue(mockSession);
     mockClient.whoAmI.mockResolvedValue({
-      workspaces: [{ id: "ws-1", name: "default", projects: [{ id: "proj-123" }] }],
+      workspaces: [{ id: "ws-1", name: "default" }],
     });
     mockSession.run.mockImplementation(() => runHandle());
   });
 
   describe("init()", () => {
-    it("resolves the project via whoAmI and creates an outbound-enabled sandbox", async () => {
+    it("resolves the workspace via whoAmI and creates an outbound-enabled sandbox", async () => {
       await executor.init();
 
       expect(mockClient.whoAmI).toHaveBeenCalled();
       expect(mockClient.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          projectId: "proj-123",
+          workspaceId: "ws-1",
           allowOutbound: true, // SDK default is networking OFF; clones need egress
           cpuCores: 2,
           memoryMb: 4096,
@@ -169,14 +169,22 @@ describe("TenkiExecutor", () => {
       expect(executor.isReady()).toBe(true);
     });
 
-    it("honors TENKI_PROJECT_ID without calling whoAmI", async () => {
-      process.env.TENKI_PROJECT_ID = "proj-explicit";
+    it("honors TENKI_WORKSPACE_ID without calling whoAmI", async () => {
+      process.env.TENKI_WORKSPACE_ID = "ws-explicit";
       await executor.init();
 
       expect(mockClient.whoAmI).not.toHaveBeenCalled();
       expect(mockClient.create).toHaveBeenCalledWith(
-        expect.objectContaining({ projectId: "proj-explicit" }),
+        expect.objectContaining({ workspaceId: "ws-explicit" }),
       );
+    });
+
+    it("rejects stale TENKI_PROJECT_ID config instead of silently ignoring it", async () => {
+      // Projects were removed in SDK 0.5.x; a deploy still setting the old var
+      // must fail loudly, not fall back to a workspace it never chose.
+      process.env.TENKI_PROJECT_ID = "proj-stale";
+      await expect(executor.init()).rejects.toThrow(/TENKI_PROJECT_ID.*TENKI_WORKSPACE_ID/s);
+      expect(mockClient.create).not.toHaveBeenCalled();
     });
 
     it("creates the /workspace layout at init", async () => {
@@ -184,29 +192,20 @@ describe("TenkiExecutor", () => {
       expect(runCmds().some((c) => c?.includes("mkdir -p /workspace/repos"))).toBe(true);
     });
 
-    it("throws when no project is visible for the key", async () => {
+    it("throws when no workspace is visible for the key", async () => {
       mockClient.whoAmI.mockResolvedValueOnce({ workspaces: [] });
-      await expect(executor.init()).rejects.toThrow(/no project visible/);
+      await expect(executor.init()).rejects.toThrow(/no workspace visible/);
     });
 
-    it("refuses to guess when multiple projects are visible", async () => {
-      mockClient.whoAmI.mockResolvedValueOnce({
-        workspaces: [{ id: "w1", name: "a", projects: [{ id: "p1" }, { id: "p2" }] }],
-      });
-      await expect(executor.init()).rejects.toThrow(/multiple projects.*TENKI_PROJECT_ID/s);
-      expect(mockClient.create).not.toHaveBeenCalled();
-    });
-
-    it("narrows to a single project via TENKI_WORKSPACE_ID", async () => {
-      process.env.TENKI_WORKSPACE_ID = "w2";
+    it("refuses to guess when multiple workspaces are visible", async () => {
       mockClient.whoAmI.mockResolvedValueOnce({
         workspaces: [
-          { id: "w1", name: "a", projects: [{ id: "p1" }] },
-          { id: "w2", name: "b", projects: [{ id: "p2" }] },
+          { id: "w1", name: "a" },
+          { id: "w2", name: "b" },
         ],
       });
-      await executor.init();
-      expect(mockClient.create).toHaveBeenCalledWith(expect.objectContaining({ projectId: "p2" }));
+      await expect(executor.init()).rejects.toThrow(/multiple workspaces.*TENKI_WORKSPACE_ID/s);
+      expect(mockClient.create).not.toHaveBeenCalled();
     });
 
     it("is idempotent — a second init() after success does not create another sandbox", async () => {
@@ -234,11 +233,40 @@ describe("TenkiExecutor", () => {
       expect(executor.isReady()).toBe(false);
     });
 
-    it("releases the client if project resolution fails before create", async () => {
+    it("releases the client if workspace resolution fails before create", async () => {
       mockClient.whoAmI.mockResolvedValueOnce({ workspaces: [] });
-      await expect(executor.init()).rejects.toThrow(/no project visible/);
+      await expect(executor.init()).rejects.toThrow(/no workspace visible/);
       expect(mockClient.close).toHaveBeenCalled();
       expect(mockClient.create).not.toHaveBeenCalled();
+    });
+
+    it("does not report ready (and refuses exec) until workspace setup completes", async () => {
+      // isReady() must not flip on session assignment alone: a concurrent caller
+      // that saw ready mid-init would skip init(), exec() without the /workspace
+      // cd, and run in /home/tenki (reproduced live in review).
+      let release!: () => void;
+      const result = { exitCode: 0, stdout: enc(""), stderr: enc(""), durationMs: 1 };
+      const gated = {
+        ...runHandle(),
+        then: (onF: (v: typeof result) => unknown, onR?: (e: unknown) => unknown) =>
+          new Promise<typeof result>((res) => {
+            release = () => res(result);
+          }).then(onF, onR),
+      };
+      mockSession.run.mockReturnValueOnce(gated); // the mkdir bootstrap, held open
+
+      const initP = executor.init();
+      await vi.waitFor(() => expect(mockSession.run).toHaveBeenCalled());
+
+      // Session exists, setup not finished: not ready, and exec is refused.
+      expect(executor.isReady()).toBe(false);
+      await expect(executor.exec("ls")).rejects.toThrow("not initialized");
+
+      release();
+      await initP;
+      expect(executor.isReady()).toBe(true);
+      await executor.exec("ls");
+      expect(lastRun()[0].at(-1)).toBe("cd /workspace && ls");
     });
   });
 
@@ -685,6 +713,45 @@ describe("TenkiExecutor", () => {
       await executor.init();
       expect(mockClient.create).toHaveBeenCalledTimes(2);
       expect(executor.isReady()).toBe(true);
+    });
+
+    it("retains the handle when init cleanup fails and retries the close on the next init", async () => {
+      // Dropping the only handle when setup AND closeIfOpen both fail strands
+      // the first VM until the maxDuration backstop while the retry boots a
+      // second one (review blocker) — so the retry must first re-attempt the
+      // orphaned close.
+      mockSession.run.mockImplementationOnce(() => runHandle({ exitCode: 1, stderr: "boom" }));
+      mockSession.closeIfOpen.mockRejectedValueOnce(new Error("close failed too"));
+
+      await expect(executor.init()).rejects.toThrow(/workspace setup failed/);
+      expect(mockSession.closeIfOpen).toHaveBeenCalledTimes(1);
+
+      await executor.init();
+      // once for the failed cleanup, once retried for the orphan before re-create
+      expect(mockSession.closeIfOpen).toHaveBeenCalledTimes(2);
+      expect(executor.isReady()).toBe(true);
+    });
+
+    it("destroy() also retries orphaned sessions from a failed init", async () => {
+      mockSession.run.mockImplementationOnce(() => runHandle({ exitCode: 1, stderr: "boom" }));
+      mockSession.closeIfOpen.mockRejectedValueOnce(new Error("close failed too"));
+      await expect(executor.init()).rejects.toThrow(/workspace setup failed/);
+
+      await executor.destroy();
+      expect(mockSession.closeIfOpen).toHaveBeenCalledTimes(2); // orphan retried
+    });
+
+    it("a still-failing orphan close stays queued and does not block or fail destroy()", async () => {
+      mockSession.run.mockImplementationOnce(() => runHandle({ exitCode: 1, stderr: "boom" }));
+      mockSession.closeIfOpen.mockRejectedValue(new Error("still down"));
+      await expect(executor.init()).rejects.toThrow(/workspace setup failed/);
+
+      await executor.destroy(); // orphan close fails again — swallowed, not thrown
+      expect(mockSession.closeIfOpen).toHaveBeenCalledTimes(2);
+
+      mockSession.closeIfOpen.mockResolvedValue(undefined);
+      await executor.destroy(); // next attempt finally closes it
+      expect(mockSession.closeIfOpen).toHaveBeenCalledTimes(3);
     });
   });
 });
