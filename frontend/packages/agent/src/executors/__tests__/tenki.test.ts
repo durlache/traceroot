@@ -680,6 +680,26 @@ describe("TenkiExecutor", () => {
       expect(executor.isReady()).toBe(false);
     });
 
+    it("supports re-init after destroy(): the new VM's bootstrap runs unscoped (no stale workDir)", async () => {
+      await executor.init();
+      await executor.destroy();
+      expect(executor.isReady()).toBe(false);
+
+      await executor.init();
+      // Both bootstraps must run WITHOUT the cd prefix — /workspace doesn't
+      // exist yet on a fresh VM; a workDir left stale from the first life would
+      // prefix the second bootstrap and wedge setup.
+      const bootstraps = (mockSession.run.mock.calls as RunCall[])
+        .map((c) => c[0].at(-1)!)
+        .filter((c) => c.includes("mkdir -p /workspace/repos"));
+      expect(bootstraps).toHaveLength(2);
+      for (const b of bootstraps) expect(b).not.toContain("cd /workspace");
+
+      expect(executor.isReady()).toBe(true);
+      await executor.exec("ls");
+      expect(lastRun()[0].at(-1)).toBe("cd /workspace && ls");
+    });
+
     it("tears down a sandbox created by an in-flight init (no leak on concurrent destroy)", async () => {
       // Hold create() open so destroy() arrives while init is mid-flight.
       let releaseCreate: (s: typeof mockSession) => void;
@@ -696,6 +716,55 @@ describe("TenkiExecutor", () => {
       await Promise.all([initP, destroyP]);
       expect(mockSession.closeIfOpen).toHaveBeenCalled(); // the created VM was torn down
       expect(executor.isReady()).toBe(false);
+    });
+  });
+
+  describe("concurrent first-use scoping (stress)", () => {
+    it("every command from 20 concurrent tool-pattern callers lands in /workspace", async () => {
+      // Models the bash tool's exact call pattern under concurrent first use:
+      // `if (!isReady()) await init(); exec(cmd)`. Pre-fix, a caller that read
+      // isReady() between session-assignment and workspace setup skipped init()
+      // and exec'd without the /workspace cd (Carl reproduced this live —
+      // command ran in /home/tenki). Hold the bootstrap open so callers pile
+      // into exactly that window, then assert NO command escaped unscoped.
+      let release!: () => void;
+      const result = { exitCode: 0, stdout: enc(""), stderr: enc(""), durationMs: 1 };
+      const gated = {
+        ...runHandle(),
+        then: (onF: (v: typeof result) => unknown, onR?: (e: unknown) => unknown) =>
+          new Promise<typeof result>((res) => {
+            release = () => res(result);
+          }).then(onF, onR),
+      };
+      mockSession.run.mockReturnValueOnce(gated); // the mkdir bootstrap, held open
+
+      const toolCall = async (cmd: string) => {
+        if (!executor.isReady()) await executor.init();
+        return executor.exec(cmd);
+      };
+
+      // First caller kicks off init; the rest arrive staggered across microtask
+      // depths so they straddle whoAmI/create resolution and the held-open setup.
+      const callers = [toolCall("pwd #0")];
+      for (let i = 1; i < 20; i++) {
+        callers.push(
+          (async () => {
+            for (let d = 0; d < i; d++) await Promise.resolve();
+            return toolCall(`pwd #${i}`);
+          })(),
+        );
+      }
+
+      await vi.waitFor(() => expect(mockSession.run).toHaveBeenCalled()); // bootstrap reached
+      release();
+      await Promise.all(callers);
+
+      expect(mockClient.create).toHaveBeenCalledTimes(1); // single-flight held
+      const cmds = runCmds().filter((c) => c?.includes("pwd"));
+      expect(cmds).toHaveLength(20);
+      for (const cmd of cmds) {
+        expect(cmd).toMatch(/^cd \/workspace && pwd/); // not one escaped unscoped
+      }
     });
   });
 

@@ -88,8 +88,14 @@ export class TenkiExecutor implements Executor {
     // can then only reach one (reproduced live in review). Share one in-flight
     // promise so concurrent callers join the same initialization; already-ready
     // callers short-circuit. On failure the promise is cleared so a later init()
-    // retries; on success `this.session` is set and this guard short-circuits.
-    if (this.session) return;
+    // retries; on success this guard short-circuits.
+    //
+    // The short-circuit must be isReady() — full readiness — not `this.session`:
+    // mid-init the session exists before workspace setup finishes, and a caller
+    // returned early then would hit exec()'s readiness gate and fail spuriously
+    // (caught by the concurrent-first-use stress test). Not-yet-ready callers
+    // fall through and join the in-flight promise below.
+    if (this.isReady()) return;
     if (!this.initPromise) {
       this.initPromise = this.doInit().finally(() => {
         this.initPromise = null;
@@ -466,6 +472,12 @@ export class TenkiExecutor implements Executor {
       console.log("[TenkiExecutor] Destroying sandbox...");
       await this.session.closeIfOpen(); // no-ops if already gone; throws only on transient failure
       this.session = null;
+      // Clear workDir with the session (ready-state fields live and die
+      // together): left stale, a re-init on this executor would prefix the new
+      // VM's bootstrap with `cd /workspace` before that directory exists and
+      // wedge setup. Cleared only on successful teardown — a failed destroy
+      // retains the handle AND ready state for retry.
+      this.workDir = "";
     }
     // Release the client's control-plane channel only once no session remains
     // (a failed init() can leave a client with no session).
