@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { TenkiSandbox } from "@tenkicloud/sandbox";
+import { TenkiSandbox, WaitReadyFailedError } from "@tenkicloud/sandbox";
 import type { Session, ProcessRunHandle } from "@tenkicloud/sandbox";
 import type { Executor, ExecResult, ExecOptions } from "./interface.js";
 
@@ -12,7 +12,7 @@ const IDLE_TIMEOUT_MINUTES = Number(process.env.TENKI_IDLE_TIMEOUT_MINUTES) || 3
 const MAX_DURATION_MS = Number(process.env.TENKI_MAX_DURATION_MS) || 2 * 60 * 60 * 1000;
 
 // Every exec is bounded in-guest by coreutils `timeout` (the SDK enforces neither
-// timeoutMs nor the abort signal — still true in 0.5.1, whose exec() passes
+// timeoutMs nor the abort signal — still true in 0.5.4, whose exec() passes
 // neither option through to run()). This ceiling applies when a caller supplies
 // no timeout, so nothing runs unbounded.
 const DEFAULT_EXEC_TIMEOUT_SECS = Number(process.env.TENKI_EXEC_TIMEOUT_SECS) || 900;
@@ -79,6 +79,9 @@ export class TenkiExecutor implements Executor {
   // Sessions whose close failed during init cleanup. The handles are retained —
   // dropping them would strand a live VM until the maxDuration backstop while a
   // retry creates a second one — and every later init()/destroy() retries them.
+  // While any remain, init() refuses to create a new VM and destroy() fails
+  // loudly: succeeding quietly would let the caller drop the executor (and with
+  // it the only handles to still-running VMs) and boot another on top.
   private orphanedSessions: Session[] = [];
 
   async init(): Promise<void> {
@@ -107,9 +110,18 @@ export class TenkiExecutor implements Executor {
   private async doInit(): Promise<void> {
     console.log("[TenkiExecutor] Creating sandbox...");
 
-    // Retry closing any session a previous failed init could not tear down,
-    // before allocating another VM on top of it.
+    // Retry closing any session a previous failed init could not tear down. A
+    // session that STILL fails to close blocks the create below: allocating a
+    // new VM while an unreachable-but-possibly-live one is queued is exactly
+    // the double-VM leak the orphan queue exists to prevent, so fail the init
+    // and let the caller retry once the close goes through.
     await this.closeOrphans();
+    if (this.orphanedSessions.length > 0) {
+      throw new Error(
+        `TenkiExecutor: ${this.orphanedSessions.length} sandbox(es) from a previous failed ` +
+          "cleanup are still open; refusing to create another until they close (retry init())",
+      );
+    }
 
     // Env-driven auth: TENKI_AUTH_TOKEN, then TENKI_API_KEY (and TENKI_API_ENDPOINT
     // for the base URL). Mirrors DaytonaExecutor's env-key pattern.
@@ -153,6 +165,14 @@ export class TenkiExecutor implements Executor {
 
       console.log(`[TenkiExecutor] Sandbox ready (${this.session.id}), workDir: ${this.workDir}`);
     } catch (err) {
+      // create() can ADMIT a sandbox and still throw: a readiness-wait failure
+      // surfaces as WaitReadyFailedError carrying the admitted session, and
+      // `this.session = await create(...)` never assigns it. Adopt that handle
+      // before resetting so the teardown below actually reaches the VM instead
+      // of leaking it until the maxDuration backstop.
+      if (!this.session && err instanceof WaitReadyFailedError) {
+        this.session = err.session;
+      }
       // Force a full reset on failure so a retry re-inits cleanly. Unlike
       // destroy() (which retains a live handle for retry), a half-initialized
       // session must NOT survive: leaving this.session set would make the init
@@ -194,10 +214,11 @@ export class TenkiExecutor implements Executor {
     this.workDir = "";
   }
 
-  // Retry closing sessions orphaned by a failed init cleanup. Never throws:
-  // callers (init retry, destroy) must proceed regardless; sessions that still
-  // fail stay queued for the next attempt and are bounded by the maxDuration
-  // backstop in the worst case.
+  // Retry closing sessions orphaned by a failed init cleanup. Never throws
+  // itself — every queued session gets a close attempt even if an earlier one
+  // fails — but callers must check orphanedSessions afterwards and refuse to
+  // proceed (init) or report failure (destroy) while any remain: a session
+  // that won't close may still be a running VM.
   private async closeOrphans(): Promise<void> {
     if (this.orphanedSessions.length === 0) return;
     const stillOrphaned: Session[] = [];
@@ -272,7 +293,7 @@ export class TenkiExecutor implements Executor {
 
     // Run via the low-level handle (not session.exec) so we can actually cancel:
     // the SDK reads neither ExecOptions.signal nor timeoutMs (verified against
-    // 0.5.1 — exec() forwards neither to run()), so this method bounds every
+    // 0.5.4 — exec() forwards neither to run()), so this method bounds every
     // command in-guest with coreutils `timeout` (exit 124) and enforces the
     // abort signal itself by killing the guest process.
     //
@@ -457,8 +478,10 @@ export class TenkiExecutor implements Executor {
       await this.initPromise.catch(() => {});
     }
 
-    // Retry any sessions a failed init could not close (never throws — a still-
-    // failing orphan must not block tearing down the live session below).
+    // Retry any sessions a failed init could not close. closeOrphans itself
+    // never throws — a still-failing orphan must not block tearing down the
+    // live session below — but any that survive fail this destroy() at the
+    // end, once the live session has had its teardown.
     await this.closeOrphans();
 
     // Terminate the session, clearing the handle only once teardown succeeds.
@@ -480,7 +503,8 @@ export class TenkiExecutor implements Executor {
       this.workDir = "";
     }
     // Release the client's control-plane channel only once no session remains
-    // (a failed init() can leave a client with no session).
+    // (a failed init() can leave a client with no session). Safe while orphans
+    // remain: each Session carries its own RPC client.
     if (this.client) {
       try {
         this.client.close();
@@ -488,6 +512,18 @@ export class TenkiExecutor implements Executor {
         // The channel is best-effort to close; the session is what matters.
       }
       this.client = null;
+    }
+
+    // Destroy is only complete when every retained session is closed. Quietly
+    // succeeding here would let the caller drop the executor — and the only
+    // handles to VMs that may still be running — after which a fresh init()
+    // could boot another on top (review blocker). Throw so the caller keeps
+    // the executor and retries; the orphans stay queued for that retry.
+    if (this.orphanedSessions.length > 0) {
+      throw new Error(
+        `TenkiExecutor: destroy incomplete — ${this.orphanedSessions.length} sandbox(es) ` +
+          "from a failed cleanup are still open; retry destroy()",
+      );
     }
   }
 

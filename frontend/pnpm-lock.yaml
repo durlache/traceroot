@@ -62,8 +62,8 @@ importers:
         specifier: ^1.19.13
         version: 1.19.13(hono@4.12.25)
       '@tenkicloud/sandbox':
-        specifier: 0.5.1
-        version: 0.5.1
+        specifier: 0.5.4
+        version: 0.5.4
       '@traceroot/core':
         specifier: workspace:*
         version: link:../core
@@ -3059,8 +3059,8 @@ packages:
   '@tanstack/virtual-core@3.14.0':
     resolution: {integrity: sha512-JLANqGy/D6k4Ujmh8Tr25lGimuOXNiaVyXaCAZS0W+1390sADdGnyUdSWNIfd49gebtIxGMij4IktRVzrdr12Q==}
 
-  '@tenkicloud/sandbox@0.5.1':
-    resolution: {integrity: sha512-2yz11vnOcmka3+69Yw/yT/EhErjifNmvPxhgAI635mOStEDq0uNY14ibQpVl5r4brsTC/oSy4ZvntBt5cOzkOQ==}
+  '@tenkicloud/sandbox@0.5.4':
+    resolution: {integrity: sha512-U/oV8TAB1rjpXHuo9DIrpxnd2tlO2MojNjzLjqKgx4+zkD4NjgpR6QzRv5awoXib0DND3bnu0qoQCIgsfcXTCw==}
     engines: {node: '>=18'}
 
   '@testing-library/dom@10.4.1':
@@ -9488,7 +9488,7 @@ snapshots:
 
   '@tanstack/virtual-core@3.14.0': {}
 
-  '@tenkicloud/sandbox@0.5.1':
+  '@tenkicloud/sandbox@0.5.4':
     dependencies:
       '@bufbuild/protobuf': 2.12.1
       '@connectrpc/connect': 2.1.2(@bufbuild/protobuf@2.12.1)

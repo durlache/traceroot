@@ -17,8 +17,25 @@ const mockClient = {
   close: vi.fn(),
 };
 
+// Mirrors the SDK's WaitReadyFailedError: create() ADMITTED a session but the
+// readiness wait failed; the admitted handle rides on the error. vi.hoisted so
+// the mock factory (hoisted above this file's body) can reference it.
+const { WaitReadyFailedError } = vi.hoisted(() => {
+  class WaitReadyFailedError extends Error {
+    name = "WaitReadyFailedError";
+    constructor(
+      message: string,
+      readonly session: unknown,
+    ) {
+      super(message);
+    }
+  }
+  return { WaitReadyFailedError };
+});
+
 vi.mock("@tenkicloud/sandbox", () => ({
   TenkiSandbox: vi.fn().mockImplementation(() => mockClient),
+  WaitReadyFailedError,
 }));
 
 import { TenkiExecutor } from "../tenki.js";
@@ -810,17 +827,67 @@ describe("TenkiExecutor", () => {
       expect(mockSession.closeIfOpen).toHaveBeenCalledTimes(2); // orphan retried
     });
 
-    it("a still-failing orphan close stays queued and does not block or fail destroy()", async () => {
+    it("destroy() fails loudly while an orphan still won't close, and succeeds once it does", async () => {
       mockSession.run.mockImplementationOnce(() => runHandle({ exitCode: 1, stderr: "boom" }));
       mockSession.closeIfOpen.mockRejectedValue(new Error("still down"));
       await expect(executor.init()).rejects.toThrow(/workspace setup failed/);
 
-      await executor.destroy(); // orphan close fails again — swallowed, not thrown
+      // The orphan close fails again: destroy() must NOT read as success —
+      // the caller would drop the executor, and with it the only handle to a
+      // VM that may still be running (review blocker).
+      await expect(executor.destroy()).rejects.toThrow(/destroy incomplete/);
       expect(mockSession.closeIfOpen).toHaveBeenCalledTimes(2);
 
       mockSession.closeIfOpen.mockResolvedValue(undefined);
-      await executor.destroy(); // next attempt finally closes it
+      await executor.destroy(); // retried destroy finally closes it
       expect(mockSession.closeIfOpen).toHaveBeenCalledTimes(3);
+    });
+
+    it("refuses to create a new sandbox while an orphan still fails to close", async () => {
+      mockSession.run.mockImplementationOnce(() => runHandle({ exitCode: 1, stderr: "boom" }));
+      mockSession.closeIfOpen.mockRejectedValue(new Error("still down"));
+      await expect(executor.init()).rejects.toThrow(/workspace setup failed/);
+      expect(mockClient.create).toHaveBeenCalledTimes(1);
+
+      // Retry while the orphan still won't close: creating another VM on top
+      // of a possibly-live one is the double-VM leak — init must fail instead.
+      await expect(executor.init()).rejects.toThrow(/refusing to create/);
+      expect(mockClient.create).toHaveBeenCalledTimes(1);
+
+      // Once the close goes through, init proceeds normally.
+      mockSession.closeIfOpen.mockResolvedValue(undefined);
+      await executor.init();
+      expect(mockClient.create).toHaveBeenCalledTimes(2);
+      expect(executor.isReady()).toBe(true);
+    });
+
+    it("closes the admitted session when create() fails readiness (WaitReadyFailedError)", async () => {
+      // create() can admit a sandbox and then fail the readiness wait; the
+      // only handle to that VM rides on the error. Losing it leaks the VM
+      // until the maxDuration backstop.
+      mockClient.create.mockRejectedValueOnce(
+        new WaitReadyFailedError("session sbx-test created but not ready", mockSession),
+      );
+      await expect(executor.init()).rejects.toThrow(/not ready/);
+      expect(mockSession.closeIfOpen).toHaveBeenCalledTimes(1);
+      expect(executor.isReady()).toBe(false);
+
+      // A retry re-inits cleanly.
+      await executor.init();
+      expect(executor.isReady()).toBe(true);
+    });
+
+    it("queues the admitted not-ready session as an orphan when its close also fails", async () => {
+      mockClient.create.mockRejectedValueOnce(
+        new WaitReadyFailedError("session sbx-test created but not ready", mockSession),
+      );
+      mockSession.closeIfOpen.mockRejectedValueOnce(new Error("close failed too"));
+      await expect(executor.init()).rejects.toThrow(/not ready/);
+
+      // Retry: the orphaned close is re-attempted (and succeeds) before re-create.
+      await executor.init();
+      expect(mockSession.closeIfOpen).toHaveBeenCalledTimes(2);
+      expect(executor.isReady()).toBe(true);
     });
   });
 });
