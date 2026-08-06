@@ -163,6 +163,23 @@ variable "daytona_api_key" {
   default     = ""
 }
 
+variable "tenki_api_key" {
+  description = "Tenki API key for sandbox execution (when sandbox_provider = tenki)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "sandbox_provider" {
+  description = "Sandbox provider the agent uses: docker, daytona, or tenki"
+  type        = string
+  default     = "daytona"
+  validation {
+    condition     = contains(["docker", "daytona", "tenki"], var.sandbox_provider)
+    error_message = "sandbox_provider must be one of: docker, daytona, tenki."
+  }
+}
+
 # --- Stripe Billing ---
 variable "stripe_secret_key" {
   description = "Stripe secret key"
