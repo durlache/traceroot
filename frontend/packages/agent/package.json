@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@daytonaio/sdk": "0.148.0",
+    "@tenkicloud/sandbox": "0.5.4",
     "@earendil-works/pi-agent-core": "0.74.0",
     "@earendil-works/pi-ai": "0.80.3",
     "@hono/node-server": "^1.19.13",

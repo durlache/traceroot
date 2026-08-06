@@ -26,8 +26,9 @@ export interface ExecOptions {
  * Mom's base interface: exec() + getWorkspacePath()
  * Our extensions: init(), destroy(), writeFile(), readFile(), isReady()
  * Reason: host-side tools (query_traces, download_trace) run on the host
- * and need to write files into the sandbox via writeFile(), while the
- * sandbox itself has no network access.
+ * and need to write files into the sandbox via writeFile() — the sandbox
+ * holds no credentials for TraceRoot's internal APIs (it does have outbound
+ * network access for git/package installs).
  */
 export interface Executor {
   /** Initialize the sandbox/container. Called lazily on first tool use. */

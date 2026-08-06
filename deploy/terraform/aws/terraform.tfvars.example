@@ -54,6 +54,8 @@ cache_node_type = "cache.t4g.micro"
 # anthropic_api_key = "sk-ant-..."
 # openai_api_key    = "sk-proj-..."
 # daytona_api_key   = "dtn_..."
+# tenki_api_key     = "tk_..."
+# sandbox_provider  = "tenki"   # docker | daytona | tenki (default: daytona)
 
 # Google OAuth
 # google_oauth_client_id     = "123456.apps.googleusercontent.com"
